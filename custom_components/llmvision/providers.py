@@ -1009,6 +1009,26 @@ class Anthropic(Provider):
                 return content.get("text", "")
         return ""
 
+    def _maybe_enable_thinking(self, payload: dict, default_parameters: dict) -> None:
+        """Enable Anthropic extended thinking only when valid.
+
+        Skipped when: budget_tokens < 1024, budget not int, a non-default
+        temperature is set, or tool_choice forces tool use (structured output).
+        Mirrors the Google provider's budget>0 guard; int() coercion covers #660.
+        """
+        try:
+            budget = int(default_parameters.get('thinking_budget', 0) or 0)
+        except (TypeError, ValueError):
+            budget = 0
+        forces_tool = isinstance(payload.get('tool_choice'), dict) and (
+            payload['tool_choice'].get('type') == 'tool'
+        )
+        if budget >= 1024 and not forces_tool:
+            payload.pop('temperature', None)
+            if payload.get('max_tokens') and payload['max_tokens'] <= budget:
+                payload['max_tokens'] = budget + 1024
+            payload['thinking'] = {'type': 'enabled', 'budget_tokens': budget}
+
     def _prepare_vision_data(self, call: Any) -> dict:
         default_parameters = self._get_default_parameters(call)
         payload = {
@@ -1016,10 +1036,6 @@ class Anthropic(Provider):
             "messages": [{"role": "user", "content": []}],
             "max_tokens": call.max_tokens,
             "temperature": default_parameters.get("temperature"),
-            "thinking": {
-                "type": "enabled",
-                "budget_tokens": default_parameters.get("thinking_budget", 0),
-            },
         }
 
         # Add structured output support using tools
@@ -1049,6 +1065,9 @@ class Anthropic(Provider):
                 raise ServiceValidationError(
                     f"Invalid JSON in structure parameter: {str(e)}"
                 )
+
+        self._maybe_enable_thinking(payload, default_parameters)
+
         for image, filename in zip(call.base64_images, call.filenames):
             tag = (
                 ("Image " + str(call.base64_images.index(image) + 1))
@@ -1093,10 +1112,6 @@ class Anthropic(Provider):
             ],
             "max_tokens": call.max_tokens,
             "temperature": default_parameters.get("temperature"),
-            "thinking": {
-                "type": "enabled",
-                "budget_tokens": default_parameters.get("thinking_budget", 0),
-            },
         }
 
         # Add structured output support using tools
@@ -1127,6 +1142,7 @@ class Anthropic(Provider):
                     f"Invalid JSON in structure parameter: {str(e)}"
                 )
 
+        self._maybe_enable_thinking(payload, default_parameters)
         return payload
 
     async def validate(self) -> None | ServiceValidationError:
