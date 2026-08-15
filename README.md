@@ -41,6 +41,7 @@
 - Remembers people, pets and objects
 - Keeps a timeline of camera events, so you can display them on your dashboard or ask Assist about them.
 - Seamlessly updates sensors based on data extracted from camera streams, images or videos
+- Reports token usage for every provider call, so you can track and budget your AI spend from Home Assistant
 
 <br>
 
@@ -76,6 +77,51 @@ With the easy to use blueprint, you'll get camera event notifications intelligen
 </p>
 
 [Learn how to install the blueprint](https://llm-vision.gitbook.io/getting-started/setup/blueprint)
+
+## Token Usage Events
+LLM Vision fires a `llmvision_token_usage` event on the Home Assistant event bus once per provider API call, so you can meter and budget your AI spend without touching any of your existing automations.
+
+| Field | Description |
+|---|---|
+| `provider` | Provider as configured, e.g. `Anthropic`, `OpenRouter`, `Custom OpenAI` |
+| `config_entry_id` | Which provider entry made the call; `null` during setup validation |
+| `model` | Model reported by the provider, or the configured default |
+| `service` | `image_analyzer`, `video_analyzer`, `stream_analyzer`, `data_analyzer`, or `validate` |
+| `input_tokens` | All billed input tokens, cached tokens included |
+| `output_tokens` | All billed output tokens, reasoning/thinking included |
+| `total_tokens` | Reported by the provider, or `input_tokens + output_tokens` |
+| `cache_read_tokens` | Cached portion of `input_tokens` (`0` if unsupported) |
+| `cache_write_tokens` | Cache-write portion of `input_tokens` (`0` if unsupported) |
+| `reasoning_tokens` | Reasoning portion of `output_tokens` (`0` if unsupported) |
+
+>[!IMPORTANT]
+>`input_tokens` and `output_tokens` are always the full billed counts. `cache_read_tokens`, `cache_write_tokens` and `reasoning_tokens` are **subsets** of those totals, reported separately because they are usually billed at a different rate — never add them on top.
+
+Providers report usage in incompatible formats, so these counts are normalized: values are comparable across OpenAI, Anthropic, Google, AWS Bedrock, Ollama and the OpenAI-compatible providers.
+
+Note that events also fire when you save a provider in the setup flow (`service: validate`), because that performs a real API call, and that `generate_title` produces a second event for the title request.
+
+A trigger-based template sensor is the simplest way to accumulate totals:
+
+```yaml
+template:
+  - triggers:
+      - trigger: event
+        event_type: llmvision_token_usage
+    sensor:
+      - name: "LLM Vision Input Tokens"
+        unique_id: llmvision_input_tokens_total
+        state: "{{ (this.state | int(0)) + (trigger.event.data.input_tokens | int(0)) }}"
+        state_class: total_increasing
+        unit_of_measurement: tokens
+      - name: "LLM Vision Output Tokens"
+        unique_id: llmvision_output_tokens_total
+        state: "{{ (this.state | int(0)) + (trigger.event.data.output_tokens | int(0)) }}"
+        state_class: total_increasing
+        unit_of_measurement: tokens
+```
+
+Point a [Utility Meter helper](https://www.home-assistant.io/integrations/utility_meter/) at these sensors for daily or monthly cycles. Each event also carries the context of the automation or script that triggered the call, so usage can be traced back to its caller.
 
 ## Resources
 Check the docs for detailed instructions on how to set up LLM Vision and each of the supported providers, get inspiration from examples or join the discussion on the Home Assistant Community and Discord.
