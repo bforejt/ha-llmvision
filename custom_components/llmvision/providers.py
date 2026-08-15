@@ -83,13 +83,21 @@ def _coerce_token_count(value: Any) -> int:
 def extract_token_usage(response: Any) -> dict | None:
     """Normalize token usage from any provider response shape.
 
-    Providers report usage under four incompatible schemas:
+    Providers report usage under five incompatible schemas:
       - Anthropic:        usage.input_tokens / output_tokens (+ cache_* keys)
       - OpenAI-compatible: usage.prompt_tokens / completion_tokens
                            (+ prompt_tokens_details.cached_tokens)
       - Google Gemini:    usageMetadata.promptTokenCount / candidatesTokenCount
       - AWS Bedrock:      usage.inputTokens / outputTokens
       - Ollama:           prompt_eval_count / eval_count at the top level
+
+    Normalization convention: input_tokens is ALL billed input (cached tokens
+    included) and output_tokens is ALL billed output (reasoning/thinking
+    included). cache_read_tokens, cache_write_tokens and reasoning_tokens are
+    informational subsets of those figures, never additive. The raw schemas
+    disagree here — Anthropic reports cache tokens disjoint from input_tokens,
+    and Gemini reports thinking tokens outside candidatesTokenCount — so both
+    are folded in below to keep the event fields comparable across providers.
 
     Returns None when the response carries no recognizable usage data, so
     callers can skip firing an event rather than publish a row of zeros.
@@ -103,7 +111,8 @@ def extract_token_usage(response: Any) -> dict | None:
 
     # Google nests everything under usageMetadata instead of usage
     metadata = response.get("usageMetadata")
-    if isinstance(metadata, dict):
+    google_shape = isinstance(metadata, dict)
+    if google_shape:
         usage = {**usage, **metadata}
 
     # Ollama reports counts at the top level with no usage object at all
@@ -146,6 +155,23 @@ def extract_token_usage(response: Any) -> dict | None:
 
     resolved_input = _coerce_token_count(input_tokens)
     resolved_output = _coerce_token_count(output_tokens)
+
+    # Anthropic reports cache tokens DISJOINT from input_tokens (unlike
+    # OpenAI/Gemini, whose cached counts are subsets of the input figure).
+    # Fold them in so input_tokens means total billed input everywhere. The
+    # snake_case cache keys are unique to the Anthropic schema.
+    if "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage:
+        resolved_input += _coerce_token_count(
+            usage.get("cache_read_input_tokens")
+        ) + _coerce_token_count(usage.get("cache_creation_input_tokens"))
+
+    # Gemini reports thinking tokens OUTSIDE candidatesTokenCount (unlike
+    # OpenAI, whose reasoning_tokens are a subset of completion_tokens), yet
+    # bills them at the output rate and includes them in totalTokenCount.
+    # Fold them in so output_tokens means total billed output everywhere.
+    if google_shape:
+        resolved_output += _coerce_token_count(usage.get("thoughtsTokenCount"))
+
     return {
         "input_tokens": resolved_input,
         "output_tokens": resolved_output,
@@ -542,6 +568,7 @@ class Provider(ABC):
         # between concurrent requests.
         self._usage_context = None
         self._usage_service: str | None = None
+        self._usage_entry_id: str | None = None
         _LOGGER.debug(
             f"Provider initialized: {self.__class__.__name__.title()}(model={self.model}, endpoint={self.endpoint})"
         )
@@ -616,9 +643,13 @@ class Provider(ABC):
         return 60
 
     def _adopt_usage_attribution(self, call: Any) -> None:
-        """Capture the caller's HA context and service name for usage events."""
+        """Capture the caller's HA context, service and config entry for usage events."""
         self._usage_context = getattr(call, "context", None)
         self._usage_service = getattr(call, "service_name", None)
+        # ServiceCallData.provider holds the config entry id, which resolves
+        # to the user-facing provider name (e.g. "OpenRouter", which the class
+        # name cannot distinguish from "OpenAI").
+        self._usage_entry_id = getattr(call, "provider", None)
 
     def _fire_usage_event(self, response: Any) -> None:
         """Fire llmvision_token_usage for one upstream API call.
@@ -630,10 +661,19 @@ class Provider(ABC):
             usage = extract_token_usage(response)
             if not usage:
                 return
+            # Prefer the configured provider name: Custom OpenAI, Open WebUI
+            # and OpenRouter all run on the OpenAI class, and one account of a
+            # provider is indistinguishable from another by class name alone.
+            provider_name = (
+                Request.get_provider(self.hass, self._usage_entry_id)
+                if self._usage_entry_id
+                else None
+            )
             self.hass.bus.async_fire(
                 EVENT_TOKEN_USAGE,
                 {
-                    "provider": self.__class__.__name__,
+                    "provider": provider_name or self.__class__.__name__,
+                    "config_entry_id": self._usage_entry_id,
                     "model": (
                         response.get("model")
                         if isinstance(response, dict)
@@ -643,8 +683,8 @@ class Provider(ABC):
                     "service": self._usage_service,
                     **usage,
                 },
-                # Inheriting the caller's context lets HA attribute the event
-                # back to the automation or script that triggered the call.
+                # Inheriting the caller's context lets HA chain the event back
+                # to the automation or script that triggered the call.
                 context=self._usage_context,
             )
         except Exception as e:  # noqa: BLE001 - telemetry is best-effort
@@ -937,6 +977,8 @@ class OpenAI(Provider):
         return payload
 
     async def validate(self) -> None | ServiceValidationError:
+        # Validation performs a real (billed) completion
+        self._usage_service = "validate"
         if self.api_key:
             headers = self._generate_headers()
             data = {
@@ -1137,6 +1179,8 @@ class AzureOpenAI(Provider):
         return payload
 
     async def validate(self) -> None | ServiceValidationError:
+        # Validation performs a real (billed) completion
+        self._usage_service = "validate"
         if not self.api_key:
             raise ServiceValidationError("empty_api_key")
 
@@ -1399,6 +1443,8 @@ class Anthropic(Provider):
         return self._apply_parameters(payload, call)
 
     async def validate(self) -> None | ServiceValidationError:
+        # Validation performs a real (billed) completion
+        self._usage_service = "validate"
         if not self.api_key:
             raise ServiceValidationError("empty_api_key")
 
@@ -1564,6 +1610,8 @@ class Google(Provider):
         return payload
 
     async def validate(self) -> None | ServiceValidationError:
+        # Validation performs a real (billed) completion
+        self._usage_service = "validate"
         if not self.api_key:
             raise ServiceValidationError("empty_api_key")
 
@@ -1707,6 +1755,8 @@ class Groq(Provider):
         return payload
 
     async def validate(self) -> None | ServiceValidationError:
+        # Validation performs a real (billed) completion
+        self._usage_service = "validate"
         if not self.api_key:
             raise ServiceValidationError("empty_api_key")
         headers = self._generate_headers()
@@ -2305,6 +2355,8 @@ class AWSBedrock(Provider):
         return payload
 
     async def validate(self) -> None | ServiceValidationError:
+        # Validation performs a real (billed) completion
+        self._usage_service = "validate"
         data = {
             "messages": [{"role": "user", "content": [{"text": "Hi"}]}],
             "inferenceConfig": {"maxTokens": 10, "temperature": 0.5},

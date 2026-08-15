@@ -2698,6 +2698,8 @@ class TestExtractTokenUsage:
     """Test normalization of token usage across provider response shapes."""
 
     def test_anthropic_shape(self):
+        """Anthropic reports cache tokens disjoint from input_tokens; the
+        normalized input_tokens must fold them in (billed-inclusive)."""
         usage = extract_token_usage(
             {
                 "usage": {
@@ -2709,11 +2711,21 @@ class TestExtractTokenUsage:
             }
         )
 
-        assert usage["input_tokens"] == 1500
+        # 1500 uncached + 900 cache reads + 100 cache writes, all billed input
+        assert usage["input_tokens"] == 2500
         assert usage["output_tokens"] == 42
+        # cache_* stay informational subsets of input_tokens
         assert usage["cache_read_tokens"] == 900
         assert usage["cache_write_tokens"] == 100
-        # No total reported by Anthropic, so it is derived
+        # No total reported by Anthropic, so it is derived from the folded sum
+        assert usage["total_tokens"] == 2542
+
+    def test_anthropic_shape_without_cache(self):
+        usage = extract_token_usage(
+            {"usage": {"input_tokens": 1500, "output_tokens": 42}}
+        )
+
+        assert usage["input_tokens"] == 1500
         assert usage["total_tokens"] == 1542
 
     def test_openai_shape(self):
@@ -2736,12 +2748,15 @@ class TestExtractTokenUsage:
         assert usage["reasoning_tokens"] == 25
 
     def test_google_shape(self):
+        """Gemini bills thoughtsTokenCount at the output rate but reports it
+        OUTSIDE candidatesTokenCount (real responses satisfy total = prompt +
+        candidates + thoughts); normalized output_tokens must fold it in."""
         usage = extract_token_usage(
             {
                 "usageMetadata": {
                     "promptTokenCount": 250,
                     "candidatesTokenCount": 30,
-                    "totalTokenCount": 280,
+                    "totalTokenCount": 292,
                     "cachedContentTokenCount": 64,
                     "thoughtsTokenCount": 12,
                 }
@@ -2749,10 +2764,46 @@ class TestExtractTokenUsage:
         )
 
         assert usage["input_tokens"] == 250
-        assert usage["output_tokens"] == 30
-        assert usage["total_tokens"] == 280
+        # 30 candidate tokens + 12 thinking tokens, all billed output
+        assert usage["output_tokens"] == 42
+        assert usage["total_tokens"] == 292
+        # Gemini's cached count is already a subset of promptTokenCount
         assert usage["cache_read_tokens"] == 64
+        # reasoning stays an informational subset of output_tokens
         assert usage["reasoning_tokens"] == 12
+
+    def test_google_shape_derived_total_includes_thoughts(self):
+        """Gemini 2.5 thinks by default; a derived total must match the
+        folded input/output sums."""
+        usage = extract_token_usage(
+            {
+                "usageMetadata": {
+                    "promptTokenCount": 1000,
+                    "candidatesTokenCount": 80,
+                    "thoughtsTokenCount": 700,
+                }
+            }
+        )
+
+        assert usage["output_tokens"] == 780
+        assert usage["total_tokens"] == 1780
+
+    def test_google_thoughts_only_response(self):
+        """Gemini omits candidatesTokenCount when the model produced only
+        thoughts; output must still count the billed thinking tokens."""
+        usage = extract_token_usage(
+            {
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "thoughtsTokenCount": 50,
+                    "totalTokenCount": 150,
+                }
+            }
+        )
+
+        assert usage["input_tokens"] == 100
+        assert usage["output_tokens"] == 50
+        assert usage["total_tokens"] == 150
 
     def test_bedrock_shape(self):
         usage = extract_token_usage(
@@ -2854,6 +2905,39 @@ class TestUsageEvent:
         payload = mock_hass.bus.async_fire.call_args[0][1]
         assert payload["service"] == "image_analyzer"
 
+    def test_provider_name_resolved_from_config_entry(self, mock_hass):
+        """OpenRouter/Custom OpenAI/Open WebUI all run on the OpenAI class;
+        the event must carry the configured provider name, not the class."""
+        mock_hass.bus = Mock()
+        mock_hass.data = {
+            DOMAIN: {"entry_openrouter": {CONF_PROVIDER: "OpenRouter"}}
+        }
+        with patch("custom_components.llmvision.providers.async_get_clientsession"):
+            provider = OpenAI(mock_hass, "test_key", "google/gemma-3-4b-it:free")
+        provider._adopt_usage_attribution(
+            SimpleNamespace(provider="entry_openrouter")
+        )
+
+        provider._fire_usage_event(
+            {"usage": {"prompt_tokens": 10, "completion_tokens": 2}}
+        )
+
+        payload = mock_hass.bus.async_fire.call_args[0][1]
+        assert payload["provider"] == "OpenRouter"
+        assert payload["config_entry_id"] == "entry_openrouter"
+
+    def test_provider_name_falls_back_to_class(self, mock_hass):
+        """Without an entry id (e.g. config-flow validation) the class name
+        still identifies the provider, and config_entry_id is None."""
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+
+        provider._fire_usage_event({"usage": {"input_tokens": 5, "output_tokens": 5}})
+
+        payload = mock_hass.bus.async_fire.call_args[0][1]
+        assert payload["provider"] == "Anthropic"
+        assert payload["config_entry_id"] is None
+
     def test_attribution_defaults_to_none(self, mock_hass):
         """Calls with no service context (e.g. config validation) still work."""
         mock_hass.bus = Mock()
@@ -2874,8 +2958,9 @@ class TestUsageEvent:
         provider._fire_usage_event({"usage": {"input_tokens": 5, "output_tokens": 5}})
 
     @pytest.mark.asyncio
-    async def test_post_fires_event_for_every_provider(self, mock_hass):
-        """_post is the shared choke point, so all HTTP providers are covered."""
+    async def test_post_fires_event_for_http_providers(self, mock_hass):
+        """_post is the shared choke point for all HTTP providers (Bedrock's
+        boto3 path is covered separately in test_invoke_bedrock_fires_event)."""
         mock_hass.bus = Mock()
         with patch("custom_components.llmvision.providers.async_get_clientsession"):
             provider = OpenAI(mock_hass, "test_key", "gpt-4o")
@@ -2897,6 +2982,109 @@ class TestUsageEvent:
         assert payload["provider"] == "OpenAI"
         assert payload["input_tokens"] == 700
         assert payload["output_tokens"] == 25
+
+    @pytest.mark.asyncio
+    async def test_invoke_bedrock_fires_event(self, mock_hass):
+        """The boto3 path bypasses _post and must emit from invoke_bedrock."""
+        mock_hass.bus = Mock()
+        with patch("custom_components.llmvision.providers.async_get_clientsession"):
+            provider = AWSBedrock(
+                mock_hass,
+                aws_access_key_id="key",
+                aws_secret_access_key="secret",
+                aws_region_name="us-east-1",
+                model="us.amazon.nova-pro-v1:0",
+            )
+
+        bedrock_response = {
+            "ResponseMetadata": {"HTTPStatusCode": 200},
+            "metrics": {"latencyMs": 5},
+            "usage": {"inputTokens": 40, "outputTokens": 8, "totalTokens": 48},
+            "output": {"message": {"content": [{"text": "ok"}]}},
+        }
+        mock_client = Mock()
+        mock_client.converse = Mock(return_value=bedrock_response)
+        mock_hass.async_add_executor_job = AsyncMock(
+            side_effect=[mock_client, bedrock_response]
+        )
+
+        await provider.invoke_bedrock(model=provider.model, data={"messages": []})
+
+        mock_hass.bus.async_fire.assert_called_once()
+        event_type, payload = mock_hass.bus.async_fire.call_args[0]
+        assert event_type == EVENT_TOKEN_USAGE
+        assert payload["provider"] == "AWSBedrock"
+        assert payload["input_tokens"] == 40
+        assert payload["output_tokens"] == 8
+        assert payload["total_tokens"] == 48
+        # Bedrock responses carry no "model" string; configured model is used
+        assert payload["model"] == "us.amazon.nova-pro-v1:0"
+
+    @pytest.mark.asyncio
+    async def test_vision_request_wires_attribution_end_to_end(self, mock_hass):
+        """The full chain: a ServiceCallData-shaped call through
+        vision_request -> _post -> event, carrying context/service/entry id."""
+        mock_hass.bus = Mock()
+        mock_hass.data = {
+            DOMAIN: {"entry_anthropic": {CONF_PROVIDER: "Anthropic"}}
+        }
+        provider = self._provider(mock_hass)
+        sentinel_context = object()
+        call = SimpleNamespace(
+            context=sentinel_context,
+            service_name="image_analyzer",
+            provider="entry_anthropic",
+        )
+        provider._prepare_vision_data = Mock(return_value={"messages": []})
+
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(
+            return_value={
+                "model": "claude-sonnet-5-20260101",
+                "usage": {"input_tokens": 900, "output_tokens": 40},
+                "content": [{"type": "text", "text": "a cat"}],
+            }
+        )
+        provider.session = Mock()
+        provider.session.post = AsyncMock(return_value=mock_response)
+
+        result = await provider.vision_request(call)
+
+        assert result == "a cat"
+        mock_hass.bus.async_fire.assert_called_once()
+        payload = mock_hass.bus.async_fire.call_args[0][1]
+        kwargs = mock_hass.bus.async_fire.call_args[1]
+        assert kwargs["context"] is sentinel_context
+        assert payload["provider"] == "Anthropic"
+        assert payload["config_entry_id"] == "entry_anthropic"
+        assert payload["service"] == "image_analyzer"
+        assert payload["model"] == "claude-sonnet-5-20260101"
+        assert payload["input_tokens"] == 900
+
+    @pytest.mark.asyncio
+    async def test_validate_fires_event_labeled_validate(self, mock_hass):
+        """Config-flow validation performs a real billed completion and must
+        be labeled service: validate rather than left unattributed."""
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(
+            return_value={
+                "usage": {"input_tokens": 8, "output_tokens": 2},
+                "content": [{"type": "text", "text": "Hi"}],
+            }
+        )
+        provider.session = Mock()
+        provider.session.post = AsyncMock(return_value=mock_response)
+
+        await provider.validate()
+
+        payload = mock_hass.bus.async_fire.call_args[0][1]
+        assert payload["service"] == "validate"
+        assert payload["config_entry_id"] is None
 
 
 if __name__ == "__main__":

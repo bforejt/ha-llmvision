@@ -157,6 +157,34 @@ class TestServiceCallData:
         with pytest.raises(TypeError):
             call._convert_time_input_to_datetime(object())
 
+    def test_captures_context_and_service_for_usage_attribution(self):
+        """Pins the cross-file contract with Provider._adopt_usage_attribution:
+        providers.py reads .context and .service_name off this object."""
+        sentinel_context = object()
+        data_call = _build_data_call(_base_service_data())
+        data_call.context = sentinel_context
+        data_call.service = "image_analyzer"
+
+        call = ServiceCallData(data_call)
+
+        assert call.context is sentinel_context
+        assert call.service_name == "image_analyzer"
+
+    def test_context_and_service_default_to_none(self):
+        """A data_call without context/service attributes (a plain object, not
+        a Mock, whose auto-attributes would defeat the getattr default)."""
+        data = _base_service_data()
+        data_call = SimpleNamespace(
+            data=SimpleNamespace(
+                get=lambda key, default=None: data.get(key, default)
+            )
+        )
+
+        call = ServiceCallData(data_call)
+
+        assert call.context is None
+        assert call.service_name is None
+
 
 class TestEntryLifecycle:
     @pytest.mark.anyio
