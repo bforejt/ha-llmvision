@@ -37,6 +37,7 @@ from .const import (
     ENDPOINT_GROQ,
     ENDPOINT_OPENROUTER,
     ENDPOINT_MISTRAL,
+    EVENT_TOKEN_USAGE,
     ERROR_NOT_CONFIGURED,
     ERROR_GROQ_MULTIPLE_IMAGES,
     ERROR_NO_IMAGE_INPUT,
@@ -68,6 +69,103 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _coerce_token_count(value: Any) -> int:
+    """Coerce a provider-reported token count to a non-negative int."""
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return count if count > 0 else 0
+
+
+def extract_token_usage(response: Any) -> dict | None:
+    """Normalize token usage from any provider response shape.
+
+    Providers report usage under four incompatible schemas:
+      - Anthropic:        usage.input_tokens / output_tokens (+ cache_* keys)
+      - OpenAI-compatible: usage.prompt_tokens / completion_tokens
+                           (+ prompt_tokens_details.cached_tokens)
+      - Google Gemini:    usageMetadata.promptTokenCount / candidatesTokenCount
+      - AWS Bedrock:      usage.inputTokens / outputTokens
+      - Ollama:           prompt_eval_count / eval_count at the top level
+
+    Returns None when the response carries no recognizable usage data, so
+    callers can skip firing an event rather than publish a row of zeros.
+    """
+    if not isinstance(response, dict):
+        return None
+
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+
+    # Google nests everything under usageMetadata instead of usage
+    metadata = response.get("usageMetadata")
+    if isinstance(metadata, dict):
+        usage = {**usage, **metadata}
+
+    # Ollama reports counts at the top level with no usage object at all
+    if not usage and (
+        "prompt_eval_count" in response or "eval_count" in response
+    ):
+        usage = response
+
+    if not usage:
+        return None
+
+    input_tokens = _first_present(
+        usage, "input_tokens", "prompt_tokens", "inputTokens",
+        "promptTokenCount", "prompt_eval_count",
+    )
+    output_tokens = _first_present(
+        usage, "output_tokens", "completion_tokens", "outputTokens",
+        "candidatesTokenCount", "eval_count",
+    )
+    total_tokens = _first_present(
+        usage, "total_tokens", "totalTokens", "totalTokenCount"
+    )
+
+    # Cached/reasoning counts are optional and provider-specific
+    details = usage.get("prompt_tokens_details")
+    cache_read = _first_present(
+        usage, "cache_read_input_tokens", "cachedContentTokenCount"
+    )
+    if cache_read is None and isinstance(details, dict):
+        cache_read = details.get("cached_tokens")
+    cache_write = _first_present(usage, "cache_creation_input_tokens")
+    reasoning = _first_present(usage, "thoughtsTokenCount")
+    if reasoning is None:
+        completion_details = usage.get("completion_tokens_details")
+        if isinstance(completion_details, dict):
+            reasoning = completion_details.get("reasoning_tokens")
+
+    if input_tokens is None and output_tokens is None and total_tokens is None:
+        return None
+
+    resolved_input = _coerce_token_count(input_tokens)
+    resolved_output = _coerce_token_count(output_tokens)
+    return {
+        "input_tokens": resolved_input,
+        "output_tokens": resolved_output,
+        "total_tokens": (
+            _coerce_token_count(total_tokens)
+            if total_tokens is not None
+            else resolved_input + resolved_output
+        ),
+        "cache_read_tokens": _coerce_token_count(cache_read),
+        "cache_write_tokens": _coerce_token_count(cache_write),
+        "reasoning_tokens": _coerce_token_count(reasoning),
+    }
+
+
+def _first_present(source: dict, *keys: str) -> Any:
+    """Return the first key present in source, or None if none are."""
+    for key in keys:
+        if key in source:
+            return source.get(key)
+    return None
 
 
 class Request:
@@ -439,6 +537,11 @@ class Provider(ABC):
         self.model = model
         self.endpoint = endpoint
         self.request_timeout = self._resolve_request_timeout()
+        # Attribution for llmvision_token_usage events. A provider instance is
+        # created per service call by ProviderFactory, so this cannot leak
+        # between concurrent requests.
+        self._usage_context = None
+        self._usage_service: str | None = None
         _LOGGER.debug(
             f"Provider initialized: {self.__class__.__name__.title()}(model={self.model}, endpoint={self.endpoint})"
         )
@@ -512,11 +615,48 @@ class Provider(ABC):
                     return 60
         return 60
 
+    def _adopt_usage_attribution(self, call: Any) -> None:
+        """Capture the caller's HA context and service name for usage events."""
+        self._usage_context = getattr(call, "context", None)
+        self._usage_service = getattr(call, "service_name", None)
+
+    def _fire_usage_event(self, response: Any) -> None:
+        """Fire llmvision_token_usage for one upstream API call.
+
+        Emitted from the shared transport layer so every provider is covered.
+        Never raises: telemetry must not be able to fail a working request.
+        """
+        try:
+            usage = extract_token_usage(response)
+            if not usage:
+                return
+            self.hass.bus.async_fire(
+                EVENT_TOKEN_USAGE,
+                {
+                    "provider": self.__class__.__name__,
+                    "model": (
+                        response.get("model")
+                        if isinstance(response, dict)
+                        and isinstance(response.get("model"), str)
+                        else self.model
+                    ),
+                    "service": self._usage_service,
+                    **usage,
+                },
+                # Inheriting the caller's context lets HA attribute the event
+                # back to the automation or script that triggered the call.
+                context=self._usage_context,
+            )
+        except Exception as e:  # noqa: BLE001 - telemetry is best-effort
+            _LOGGER.debug(f"Could not fire {EVENT_TOKEN_USAGE} event: {e}")
+
     async def vision_request(self, call: dict) -> str:
+        self._adopt_usage_attribution(call)
         data = self._prepare_vision_data(call)
         return await self._make_request(data)
 
     async def title_request(self, call: Any) -> str:
+        self._adopt_usage_attribution(call)
         if isinstance(call, dict):
             call["max_tokens"] = 4096
         else:
@@ -548,6 +688,7 @@ class Provider(ABC):
         else:
             response_data = await response.json()
             _LOGGER.debug(f"Response data: {response_data}")
+            self._fire_usage_event(response_data)
             return response_data
 
     async def _resolve_error(self, response, provider: str) -> str:
@@ -2039,6 +2180,8 @@ class AWSBedrock(Provider):
             _LOGGER.debug(
                 f"AWS Bedrock call latency: {latency}ms inputTokens: {tokens_in} outputTokens: {tokens_out} totalTokens: {tokens_total}"
             )
+            # boto3 bypasses _post, so usage is surfaced here instead
+            self._fire_usage_event(response)
             response_data = response.get("output")
             _LOGGER.debug(f"AWS Bedrock call response data: {response_data}")
         return response_data

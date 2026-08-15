@@ -446,6 +446,10 @@ class ServiceCallData:
     """Store service call data and set default values"""
 
     def __init__(self, data_call):
+        # Preserved so token usage events can be attributed back to the
+        # automation/script that triggered the call (HA context chaining).
+        self.context = getattr(data_call, "context", None)
+        self.service_name = getattr(data_call, "service", None)
         # This is the config entry id
         self.provider = str(data_call.data.get(PROVIDER))
         # If not set, the conf_default_model will be set in providers.py

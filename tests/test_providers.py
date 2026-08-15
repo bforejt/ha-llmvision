@@ -19,9 +19,11 @@ from custom_components.llmvision.providers import (
     AWSBedrock,
     Mistral,
     ProviderFactory,
+    extract_token_usage,
 )
 from custom_components.llmvision.const import (
     DOMAIN,
+    EVENT_TOKEN_USAGE,
     CONF_API_KEY,
     CONF_PROVIDER,
     CONF_DEFAULT_MODEL,
@@ -2690,6 +2692,211 @@ def test_anthropic_unsupported_model_omits_disabled_thinking_parameter(coverage_
     payload = provider._prepare_text_data(make_coverage_call(max_tokens=4096))
 
     assert "thinking" not in payload
+
+
+class TestExtractTokenUsage:
+    """Test normalization of token usage across provider response shapes."""
+
+    def test_anthropic_shape(self):
+        usage = extract_token_usage(
+            {
+                "usage": {
+                    "input_tokens": 1500,
+                    "output_tokens": 42,
+                    "cache_read_input_tokens": 900,
+                    "cache_creation_input_tokens": 100,
+                }
+            }
+        )
+
+        assert usage["input_tokens"] == 1500
+        assert usage["output_tokens"] == 42
+        assert usage["cache_read_tokens"] == 900
+        assert usage["cache_write_tokens"] == 100
+        # No total reported by Anthropic, so it is derived
+        assert usage["total_tokens"] == 1542
+
+    def test_openai_shape(self):
+        usage = extract_token_usage(
+            {
+                "usage": {
+                    "prompt_tokens": 800,
+                    "completion_tokens": 60,
+                    "total_tokens": 860,
+                    "prompt_tokens_details": {"cached_tokens": 512},
+                    "completion_tokens_details": {"reasoning_tokens": 25},
+                }
+            }
+        )
+
+        assert usage["input_tokens"] == 800
+        assert usage["output_tokens"] == 60
+        assert usage["total_tokens"] == 860
+        assert usage["cache_read_tokens"] == 512
+        assert usage["reasoning_tokens"] == 25
+
+    def test_google_shape(self):
+        usage = extract_token_usage(
+            {
+                "usageMetadata": {
+                    "promptTokenCount": 250,
+                    "candidatesTokenCount": 30,
+                    "totalTokenCount": 280,
+                    "cachedContentTokenCount": 64,
+                    "thoughtsTokenCount": 12,
+                }
+            }
+        )
+
+        assert usage["input_tokens"] == 250
+        assert usage["output_tokens"] == 30
+        assert usage["total_tokens"] == 280
+        assert usage["cache_read_tokens"] == 64
+        assert usage["reasoning_tokens"] == 12
+
+    def test_bedrock_shape(self):
+        usage = extract_token_usage(
+            {"usage": {"inputTokens": 400, "outputTokens": 20, "totalTokens": 420}}
+        )
+
+        assert usage["input_tokens"] == 400
+        assert usage["output_tokens"] == 20
+        assert usage["total_tokens"] == 420
+
+    def test_ollama_top_level_shape(self):
+        usage = extract_token_usage({"prompt_eval_count": 310, "eval_count": 75})
+
+        assert usage["input_tokens"] == 310
+        assert usage["output_tokens"] == 75
+        assert usage["total_tokens"] == 385
+
+    def test_returns_none_without_usage(self):
+        assert extract_token_usage({"content": [{"type": "text"}]}) is None
+        assert extract_token_usage({}) is None
+        assert extract_token_usage(None) is None
+        assert extract_token_usage("not a dict") is None
+
+    def test_handles_malformed_counts(self):
+        """Nulls and junk must not raise or produce negative counts."""
+        usage = extract_token_usage(
+            {"usage": {"input_tokens": None, "output_tokens": "abc"}}
+        )
+
+        assert usage["input_tokens"] == 0
+        assert usage["output_tokens"] == 0
+        assert usage["total_tokens"] == 0
+
+    def test_zero_usage_still_reported(self):
+        """A real usage block of zeros is distinct from no usage at all."""
+        usage = extract_token_usage({"usage": {"input_tokens": 0, "output_tokens": 0}})
+
+        assert usage is not None
+        assert usage["input_tokens"] == 0
+
+
+class TestUsageEvent:
+    """Test llmvision_token_usage event emission."""
+
+    def _provider(self, mock_hass):
+        with patch("custom_components.llmvision.providers.async_get_clientsession"):
+            return Anthropic(mock_hass, "test_key", "claude-sonnet-5")
+
+    def test_fires_event_with_normalized_payload(self, mock_hass):
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+
+        provider._fire_usage_event(
+            {
+                "model": "claude-sonnet-5-20260101",
+                "usage": {"input_tokens": 1200, "output_tokens": 35},
+            }
+        )
+
+        mock_hass.bus.async_fire.assert_called_once()
+        event_type, payload = mock_hass.bus.async_fire.call_args[0]
+        assert event_type == EVENT_TOKEN_USAGE
+        assert payload["provider"] == "Anthropic"
+        # Model is taken from the response, not the configured default
+        assert payload["model"] == "claude-sonnet-5-20260101"
+        assert payload["input_tokens"] == 1200
+        assert payload["output_tokens"] == 35
+
+    def test_falls_back_to_configured_model(self, mock_hass):
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+
+        provider._fire_usage_event({"usage": {"input_tokens": 10, "output_tokens": 1}})
+
+        payload = mock_hass.bus.async_fire.call_args[0][1]
+        assert payload["model"] == "claude-sonnet-5"
+
+    def test_no_event_without_usage(self, mock_hass):
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+
+        provider._fire_usage_event({"content": [{"type": "text", "text": "hi"}]})
+
+        mock_hass.bus.async_fire.assert_not_called()
+
+    def test_propagates_caller_context_and_service(self, mock_hass):
+        """Context chaining is what allows per-automation cost attribution."""
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+        sentinel_context = object()
+        provider._adopt_usage_attribution(
+            SimpleNamespace(context=sentinel_context, service_name="image_analyzer")
+        )
+
+        provider._fire_usage_event({"usage": {"input_tokens": 5, "output_tokens": 5}})
+
+        kwargs = mock_hass.bus.async_fire.call_args[1]
+        assert kwargs["context"] is sentinel_context
+        payload = mock_hass.bus.async_fire.call_args[0][1]
+        assert payload["service"] == "image_analyzer"
+
+    def test_attribution_defaults_to_none(self, mock_hass):
+        """Calls with no service context (e.g. config validation) still work."""
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+        provider._adopt_usage_attribution(SimpleNamespace())
+
+        provider._fire_usage_event({"usage": {"input_tokens": 5, "output_tokens": 5}})
+
+        assert mock_hass.bus.async_fire.call_args[0][1]["service"] is None
+        assert mock_hass.bus.async_fire.call_args[1]["context"] is None
+
+    def test_event_failure_never_breaks_request(self, mock_hass):
+        """Telemetry is best-effort and must not propagate exceptions."""
+        mock_hass.bus = Mock()
+        mock_hass.bus.async_fire = Mock(side_effect=RuntimeError("bus down"))
+        provider = self._provider(mock_hass)
+
+        provider._fire_usage_event({"usage": {"input_tokens": 5, "output_tokens": 5}})
+
+    @pytest.mark.asyncio
+    async def test_post_fires_event_for_every_provider(self, mock_hass):
+        """_post is the shared choke point, so all HTTP providers are covered."""
+        mock_hass.bus = Mock()
+        with patch("custom_components.llmvision.providers.async_get_clientsession"):
+            provider = OpenAI(mock_hass, "test_key", "gpt-4o")
+
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(
+            return_value={
+                "usage": {"prompt_tokens": 700, "completion_tokens": 25},
+                "choices": [{"message": {"content": "ok"}}],
+            }
+        )
+        provider.session = Mock()
+        provider.session.post = AsyncMock(return_value=mock_response)
+
+        await provider._post(url="https://example.test", headers={}, data={})
+
+        payload = mock_hass.bus.async_fire.call_args[0][1]
+        assert payload["provider"] == "OpenAI"
+        assert payload["input_tokens"] == 700
+        assert payload["output_tokens"] == 25
 
 
 if __name__ == "__main__":

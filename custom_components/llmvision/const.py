@@ -161,3 +161,6 @@ ENDPOINT_OPENWEBUI = "{protocol}://{ip_address}:{port}/api/chat/completions"
 ENDPOINT_AZURE = "{base_url}openai/deployments/{deployment}/chat/completions?api-version={api_version}"
 ENDPOINT_OPENROUTER = "https://openrouter.ai/api/v1/chat/completions"
 ENDPOINT_MISTRAL = "https://api.mistral.ai/v1/chat/completions"
+
+# Fired once per upstream API call with normalized token counts
+EVENT_TOKEN_USAGE = "llmvision_token_usage"
