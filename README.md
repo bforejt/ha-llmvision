@@ -99,7 +99,11 @@ LLM Vision fires a `llmvision_token_usage` event on the Home Assistant event bus
 
 Providers report usage in incompatible formats, so these counts are normalized: values are comparable across OpenAI, Anthropic, Google, AWS Bedrock, Ollama and the OpenAI-compatible providers.
 
-Note that events also fire when you save a provider in the setup flow (`service: validate`), because that performs a real API call, and that `generate_title` produces a second event for the title request.
+Since schema 2 (fork build 1.7.1.2), each event also carries the request's identity and shape — `request_type` (`vision`/`title`/`validate`), `source` + `source_kind` (the camera entity or file stem that was analyzed), `frigate_event_id`, `target_entity` (data_analyzer's target), `frame_count`, `target_width`, `request_max_tokens`, `prompt_hash`/`prompt_chars` (vision requests only), `use_memory`, `generate_title`, `response_format`, `fallback_from` (the original provider when served by the fallback) — plus response metadata: `latency_ms`, `finish_reason` (normalized `stop`/`length`/`tool_use`/`safety`/`other`; `length` means the output was truncated), and the provider's `response_id`. A `schema` field versions the payload.
+
+Failed calls fire a separate `llmvision_call_error` event (transport-level: non-200 or network failure) with `status_code`, a normalized `error_type` (`auth`/`not_found`/`bad_request`/`rate_limit`/`overloaded`/`server`/`network`), `latency_ms`, and the same identity fields — but never token counts or message content. Successful billed calls and failures are deliberately separate streams so usage totals stay clean.
+
+Note that events also fire when you save a provider in the setup flow (`service: validate`), because that performs a real API call, and that `generate_title` produces a second event for the title request (`request_type: title`).
 
 A trigger-based template sensor is the simplest way to accumulate totals:
 

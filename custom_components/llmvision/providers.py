@@ -6,8 +6,11 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.core import HomeAssistant
 from functools import partial
 from typing import Any, cast
+from time import perf_counter
 import logging
 import inspect
+import hashlib
+import os
 import re
 import json
 import base64
@@ -38,6 +41,7 @@ from .const import (
     ENDPOINT_OPENROUTER,
     ENDPOINT_MISTRAL,
     EVENT_TOKEN_USAGE,
+    EVENT_CALL_ERROR,
     ERROR_NOT_CONFIGURED,
     ERROR_GROQ_MULTIPLE_IMAGES,
     ERROR_NO_IMAGE_INPUT,
@@ -194,6 +198,155 @@ def _first_present(source: dict, *keys: str) -> Any:
     return None
 
 
+def extract_finish_reason(response: Any) -> str | None:
+    """Normalize the provider's finish/stop reason to a small bounded enum.
+
+    Raw locations per provider:
+      - Anthropic:         stop_reason (end_turn / max_tokens / tool_use / ...)
+      - AWS Bedrock:       stopReason  (end_turn / max_tokens / tool_use)
+      - OpenAI-compatible: choices[0].finish_reason (stop / length /
+                           tool_calls / content_filter)
+      - Google Gemini:     candidates[0].finishReason (STOP / MAX_TOKENS /
+                           SAFETY / RECITATION / ...)
+      - Ollama:            done_reason (stop / length)
+
+    Normalized values: stop | length | tool_use | safety | other.
+    Returns None when the response carries no recognizable reason. `length`
+    is the actionable one — output was truncated at the requested cap.
+    """
+    if not isinstance(response, dict):
+        return None
+    raw = None
+    if isinstance(response.get("stop_reason"), str):
+        raw = response["stop_reason"]
+    elif isinstance(response.get("stopReason"), str):
+        raw = response["stopReason"]
+    else:
+        choices = response.get("choices")
+        candidates = response.get("candidates")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            raw = choices[0].get("finish_reason")
+        elif (
+            isinstance(candidates, list)
+            and candidates
+            and isinstance(candidates[0], dict)
+        ):
+            raw = candidates[0].get("finishReason")
+        elif isinstance(response.get("done_reason"), str):
+            raw = response["done_reason"]
+    if not isinstance(raw, str) or not raw:
+        return None
+    raw = raw.lower()
+    if raw in ("end_turn", "stop", "stop_sequence", "completed"):
+        return "stop"
+    if raw in ("max_tokens", "length", "max_output_tokens"):
+        return "length"
+    if raw in ("tool_use", "tool_calls", "function_call"):
+        return "tool_use"
+    if raw in (
+        "content_filter",
+        "safety",
+        "recitation",
+        "prohibited_content",
+        "blocklist",
+        "refusal",
+    ):
+        return "safety"
+    return "other"
+
+
+def extract_response_id(response: Any) -> str | None:
+    """Extract the provider's response/request id from the response body.
+
+    Locations: Anthropic/OpenAI `id`, Google `responseId`, AWS Bedrock (boto3)
+    `ResponseMetadata.RequestId`. Ollama has none. Returns None when absent.
+    """
+    if not isinstance(response, dict):
+        return None
+    rid = response.get("id") or response.get("responseId")
+    if isinstance(rid, str) and rid:
+        return rid
+    meta = response.get("ResponseMetadata")
+    if isinstance(meta, dict):
+        rid = meta.get("RequestId")
+        if isinstance(rid, str) and rid:
+            return rid
+    return None
+
+
+def _classify_http_error(status: int) -> str:
+    """Map an HTTP status to the normalized error_type enum."""
+    if status in (401, 403):
+        return "auth"
+    if status == 404:
+        return "not_found"
+    if status == 400:
+        return "bad_request"
+    if status == 429:
+        return "rate_limit"
+    if status == 529:
+        return "overloaded"
+    if status >= 500:
+        return "server"
+    return "other"
+
+
+def _resolve_source(call: Any) -> tuple[str | None, str, str | None, str | None]:
+    """Resolve the analyzed input's identity for the usage event.
+
+    Returns (source, source_kind, media, frigate_event_id). Resolution order,
+    first match wins: image entity -> image path stem -> video path stem ->
+    Frigate event id -> none. Path-based capture is first-class because the
+    highest-volume callers pass file paths, not entities (see v2 design).
+    Stems are NOT prettified here — display aliasing is a package/Grafana
+    concern, not a provider-layer one.
+    """
+    entities = getattr(call, "image_entities", None) or []
+    if entities:
+        return str(entities[0]), "entity", str(entities[0]), None
+    for attr in ("image_paths", "video_paths"):
+        paths = getattr(call, attr, None) or []
+        if paths:
+            raw = str(paths[0])
+            stem = os.path.splitext(os.path.basename(raw))[0]
+            return (stem or None), "path", raw, None
+    event_ids = getattr(call, "event_id", None) or []
+    if event_ids:
+        # Frigate event ids are unbounded -> never a tag; carried separately
+        return None, "frigate_event", None, str(event_ids[0])
+    return None, "none", None, None
+
+
+def _as_int_or_none(value: Any) -> int | None:
+    """Coerce to int, or None when absent/unconvertible."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# Per-request attribution defaults: every key the v2 payload carries beyond
+# the v1 identity/usage fields. _adopt_usage_attribution overwrites these per
+# call; validate() paths set only request_type and inherit the rest.
+_USAGE_REQUEST_DEFAULTS = {
+    "request_type": None,
+    "source": None,
+    "source_kind": "none",
+    "media": None,
+    "frigate_event_id": None,
+    "target_entity": None,
+    "frame_count": None,
+    "target_width": None,
+    "request_max_tokens": None,
+    "prompt_hash": None,
+    "prompt_chars": None,
+    "use_memory": False,
+    "generate_title": False,
+    "response_format": None,
+    "fallback_from": None,
+}
+
+
 class Request:
 
     def __init__(self, hass: HomeAssistant, message, max_tokens, temperature):
@@ -340,6 +493,10 @@ class Request:
                 and fallback_provider != call.provider
             ):
                 _LOGGER.info(f"Trying fallback provider: {fallback_provider}")
+                # Mark the retry so its usage events carry fallback_from —
+                # the recursion overwrites call.provider, destroying the
+                # original identity otherwise.
+                call._fallback_of = provider_name
                 call.provider = fallback_provider
                 call.model = None
                 return await self.call(call, _is_fallback_retry=True)
@@ -399,6 +556,7 @@ class Request:
                 and fallback_provider != call.provider
             ):
                 _LOGGER.info(f"Trying fallback provider for title: {fallback_provider}")
+                call._fallback_of = provider_name
                 call.provider = fallback_provider
                 call.model = None
                 return await self.call(call, _is_fallback_retry=True)
@@ -569,6 +727,9 @@ class Provider(ABC):
         self._usage_context = None
         self._usage_service: str | None = None
         self._usage_entry_id: str | None = None
+        # Per-request shape/identity fields (v2 payload) — see
+        # _USAGE_REQUEST_DEFAULTS for the full key set.
+        self._usage_request: dict = {}
         _LOGGER.debug(
             f"Provider initialized: {self.__class__.__name__.title()}(model={self.model}, endpoint={self.endpoint})"
         )
@@ -643,7 +804,8 @@ class Provider(ABC):
         return 60
 
     def _adopt_usage_attribution(self, call: Any) -> None:
-        """Capture the caller's HA context, service and config entry for usage events."""
+        """Capture the caller's HA context, service, config entry and request
+        shape for usage events."""
         self._usage_context = getattr(call, "context", None)
         self._usage_service = getattr(call, "service_name", None)
         # ServiceCallData.provider holds the config entry id, which resolves
@@ -651,7 +813,40 @@ class Provider(ABC):
         # name cannot distinguish from "OpenAI").
         self._usage_entry_id = getattr(call, "provider", None)
 
-    def _fire_usage_event(self, response: Any) -> None:
+        source, source_kind, media, frigate_event_id = _resolve_source(call)
+        # Prompt identity is captured HERE, at vision/data adopt time — the
+        # title flow later overwrites call.message with the response text, so
+        # a hash taken any later would be unique per call (see v2 design:
+        # hazards). title_request explicitly nulls these.
+        message = getattr(call, "message", None)
+        prompt_hash = None
+        prompt_chars = None
+        if isinstance(message, str) and message:
+            prompt_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()[:12]
+            prompt_chars = len(message)
+        base64_images = getattr(call, "base64_images", None)
+        self._usage_request = {
+            "request_type": "vision",
+            "source": source,
+            "source_kind": source_kind,
+            "media": media,
+            "frigate_event_id": frigate_event_id,
+            "target_entity": getattr(call, "sensor_entity", None) or None,
+            "frame_count": (
+                len(base64_images) if isinstance(base64_images, list) else None
+            ),
+            "target_width": _as_int_or_none(getattr(call, "target_width", None)),
+            "request_max_tokens": _as_int_or_none(getattr(call, "max_tokens", None)),
+            "prompt_hash": prompt_hash,
+            "prompt_chars": prompt_chars,
+            "use_memory": bool(getattr(call, "use_memory", False)),
+            "generate_title": bool(getattr(call, "generate_title", False)),
+            "response_format": getattr(call, "response_format", None),
+            # Set by Request.call before a fallback retry; None on primary
+            "fallback_from": getattr(call, "_fallback_of", None),
+        }
+
+    def _fire_usage_event(self, response: Any, latency_ms: int | None = None) -> None:
         """Fire llmvision_token_usage for one upstream API call.
 
         Emitted from the shared transport layer so every provider is covered.
@@ -672,6 +867,7 @@ class Provider(ABC):
             self.hass.bus.async_fire(
                 EVENT_TOKEN_USAGE,
                 {
+                    "schema": 2,
                     "provider": provider_name or self.__class__.__name__,
                     "config_entry_id": self._usage_entry_id,
                     "model": (
@@ -682,6 +878,10 @@ class Provider(ABC):
                     ),
                     "service": self._usage_service,
                     **usage,
+                    **{**_USAGE_REQUEST_DEFAULTS, **self._usage_request},
+                    "latency_ms": latency_ms,
+                    "finish_reason": extract_finish_reason(response),
+                    "response_id": extract_response_id(response),
                 },
                 # Inheriting the caller's context lets HA chain the event back
                 # to the automation or script that triggered the call.
@@ -689,6 +889,48 @@ class Provider(ABC):
             )
         except Exception as e:  # noqa: BLE001 - telemetry is best-effort
             _LOGGER.debug(f"Could not fire {EVENT_TOKEN_USAGE} event: {e}")
+
+    def _fire_error_event(
+        self,
+        status_code: int | None,
+        error_type: str,
+        latency_ms: int | None = None,
+    ) -> None:
+        """Fire llmvision_call_error for a FAILED upstream API call.
+
+        Separate event type by design: the usage event's contract is "a billed
+        call happened, here are its tokens" — zero-token error rows inside it
+        would corrupt accumulator/counter semantics for existing consumers.
+        Carries NO token counts (unknown on failure) and NO message content or
+        provider error text (size/privacy). Never raises.
+        """
+        try:
+            provider_name = (
+                Request.get_provider(self.hass, self._usage_entry_id)
+                if self._usage_entry_id
+                else None
+            )
+            req = {**_USAGE_REQUEST_DEFAULTS, **self._usage_request}
+            self.hass.bus.async_fire(
+                EVENT_CALL_ERROR,
+                {
+                    "schema": 1,
+                    "provider": provider_name or self.__class__.__name__,
+                    "config_entry_id": self._usage_entry_id,
+                    "model": self.model,
+                    "service": self._usage_service,
+                    "request_type": req["request_type"],
+                    "source": req["source"],
+                    "source_kind": req["source_kind"],
+                    "fallback_from": req["fallback_from"],
+                    "status_code": status_code,
+                    "error_type": error_type,
+                    "latency_ms": latency_ms,
+                },
+                context=self._usage_context,
+            )
+        except Exception as e:  # noqa: BLE001 - telemetry is best-effort
+            _LOGGER.debug(f"Could not fire {EVENT_CALL_ERROR} event: {e}")
 
     async def vision_request(self, call: dict) -> str:
         self._adopt_usage_attribution(call)
@@ -701,6 +943,20 @@ class Provider(ABC):
             call["max_tokens"] = 4096
         else:
             call.max_tokens = 4096
+        # The title request is text-only, and by this point Request.call has
+        # overwritten call.message with the prior response — so per-request
+        # identity fields captured by the adopt above would be wrong (frames
+        # it does not send) or unbounded (a hash unique to every response).
+        # Override them; see v2 design: hazards.
+        self._usage_request.update(
+            {
+                "request_type": "title",
+                "frame_count": 0,
+                "prompt_hash": None,
+                "prompt_chars": None,
+                "request_max_tokens": 4096,
+            }
+        )
         data = self._prepare_text_data(call)
         return await self._make_request(data)
 
@@ -709,6 +965,7 @@ class Provider(ABC):
         _LOGGER.debug(f"Request data: {Request.sanitize_data(data)}")
         # Sanitize url
         san_url = re.sub(r"\?key=[^&]*", "", url)
+        start = perf_counter()
         try:
             _LOGGER.debug(f"Posting to {san_url}")
             response = await self.session.post(
@@ -718,17 +975,29 @@ class Provider(ABC):
                 timeout=ClientTimeout(total=self.request_timeout),
             )
         except Exception as e:
+            self._fire_error_event(
+                status_code=None,
+                error_type="network",
+                latency_ms=int((perf_counter() - start) * 1000),
+            )
             raise ServiceValidationError(f"Request failed: {e}")
 
         if response.status != 200:
             frame = inspect.stack()[1]
             provider = frame.frame.f_locals["self"].__class__.__name__.lower()
             parsed_response = await self._resolve_error(response, provider)
+            self._fire_error_event(
+                status_code=response.status,
+                error_type=_classify_http_error(response.status),
+                latency_ms=int((perf_counter() - start) * 1000),
+            )
             raise ServiceValidationError(parsed_response)
         else:
             response_data = await response.json()
+            # Wall-clock request -> body parsed, uniform across providers
+            latency_ms = int((perf_counter() - start) * 1000)
             _LOGGER.debug(f"Response data: {response_data}")
-            self._fire_usage_event(response_data)
+            self._fire_usage_event(response_data, latency_ms=latency_ms)
             return response_data
 
     async def _resolve_error(self, response, provider: str) -> str:
@@ -979,6 +1248,7 @@ class OpenAI(Provider):
     async def validate(self) -> None | ServiceValidationError:
         # Validation performs a real (billed) completion
         self._usage_service = "validate"
+        self._usage_request = {"request_type": "validate"}
         if self.api_key:
             headers = self._generate_headers()
             data = {
@@ -1181,6 +1451,7 @@ class AzureOpenAI(Provider):
     async def validate(self) -> None | ServiceValidationError:
         # Validation performs a real (billed) completion
         self._usage_service = "validate"
+        self._usage_request = {"request_type": "validate"}
         if not self.api_key:
             raise ServiceValidationError("empty_api_key")
 
@@ -1445,6 +1716,7 @@ class Anthropic(Provider):
     async def validate(self) -> None | ServiceValidationError:
         # Validation performs a real (billed) completion
         self._usage_service = "validate"
+        self._usage_request = {"request_type": "validate"}
         if not self.api_key:
             raise ServiceValidationError("empty_api_key")
 
@@ -1612,6 +1884,7 @@ class Google(Provider):
     async def validate(self) -> None | ServiceValidationError:
         # Validation performs a real (billed) completion
         self._usage_service = "validate"
+        self._usage_request = {"request_type": "validate"}
         if not self.api_key:
             raise ServiceValidationError("empty_api_key")
 
@@ -1757,6 +2030,7 @@ class Groq(Provider):
     async def validate(self) -> None | ServiceValidationError:
         # Validation performs a real (billed) completion
         self._usage_service = "validate"
+        self._usage_request = {"request_type": "validate"}
         if not self.api_key:
             raise ServiceValidationError("empty_api_key")
         headers = self._generate_headers()
@@ -2179,6 +2453,7 @@ class AWSBedrock(Provider):
         """Post data to url and return response data"""
         _LOGGER.debug(f"AWS Bedrock request data: {Request.sanitize_data(data)}")
 
+        start = perf_counter()
         try:
             _LOGGER.info(f"Invoking Bedrock model {model} in {self.aws_region}")
             client = await self.hass.async_add_executor_job(
@@ -2212,12 +2487,23 @@ class AWSBedrock(Provider):
             _LOGGER.debug(f"AWS Bedrock call Response: {response}")
 
         except Exception as e:
+            self._fire_error_event(
+                status_code=None,
+                error_type="network",
+                latency_ms=int((perf_counter() - start) * 1000),
+            )
             raise ServiceValidationError(f"Request failed: {e}")
 
         if response["ResponseMetadata"]["HTTPStatusCode"] != 200:
+            status = response["ResponseMetadata"]["HTTPStatusCode"]
             frame = inspect.stack()[1]
             provider = frame.frame.f_locals["self"].__class__.__name__.lower()
             parsed_response = await self._resolve_error(response, provider)
+            self._fire_error_event(
+                status_code=status,
+                error_type=_classify_http_error(status),
+                latency_ms=int((perf_counter() - start) * 1000),
+            )
             raise ServiceValidationError(parsed_response)
         else:
             # get observability data
@@ -2230,8 +2516,12 @@ class AWSBedrock(Provider):
             _LOGGER.debug(
                 f"AWS Bedrock call latency: {latency}ms inputTokens: {tokens_in} outputTokens: {tokens_out} totalTokens: {tokens_total}"
             )
-            # boto3 bypasses _post, so usage is surfaced here instead
-            self._fire_usage_event(response)
+            # boto3 bypasses _post, so usage is surfaced here instead.
+            # Wall-clock latency for uniformity with HTTP providers; the
+            # server-side metrics.latencyMs above stays a debug log.
+            self._fire_usage_event(
+                response, latency_ms=int((perf_counter() - start) * 1000)
+            )
             response_data = response.get("output")
             _LOGGER.debug(f"AWS Bedrock call response data: {response_data}")
         return response_data
@@ -2357,6 +2647,7 @@ class AWSBedrock(Provider):
     async def validate(self) -> None | ServiceValidationError:
         # Validation performs a real (billed) completion
         self._usage_service = "validate"
+        self._usage_request = {"request_type": "validate"}
         data = {
             "messages": [{"role": "user", "content": [{"text": "Hi"}]}],
             "inferenceConfig": {"maxTokens": 10, "temperature": 0.5},

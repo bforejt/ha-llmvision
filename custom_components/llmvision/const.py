@@ -164,3 +164,5 @@ ENDPOINT_MISTRAL = "https://api.mistral.ai/v1/chat/completions"
 
 # Fired once per upstream API call with normalized token counts
 EVENT_TOKEN_USAGE = "llmvision_token_usage"
+# Fired once per FAILED upstream API call (transport-level: non-200 or exception)
+EVENT_CALL_ERROR = "llmvision_call_error"

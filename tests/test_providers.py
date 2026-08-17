@@ -20,10 +20,15 @@ from custom_components.llmvision.providers import (
     Mistral,
     ProviderFactory,
     extract_token_usage,
+    extract_finish_reason,
+    extract_response_id,
+    _classify_http_error,
+    _resolve_source,
 )
 from custom_components.llmvision.const import (
     DOMAIN,
     EVENT_TOKEN_USAGE,
+    EVENT_CALL_ERROR,
     CONF_API_KEY,
     CONF_PROVIDER,
     CONF_DEFAULT_MODEL,
@@ -3085,6 +3090,404 @@ class TestUsageEvent:
         payload = mock_hass.bus.async_fire.call_args[0][1]
         assert payload["service"] == "validate"
         assert payload["config_entry_id"] is None
+
+
+class TestExtractFinishReason:
+    """Normalization of finish/stop reasons across the five provider shapes."""
+
+    @pytest.mark.parametrize(
+        "response,expected",
+        [
+            ({"stop_reason": "end_turn"}, "stop"),
+            ({"stop_reason": "max_tokens"}, "length"),
+            ({"stop_reason": "tool_use"}, "tool_use"),
+            ({"stopReason": "end_turn"}, "stop"),
+            ({"stopReason": "max_tokens"}, "length"),
+            ({"choices": [{"finish_reason": "stop"}]}, "stop"),
+            ({"choices": [{"finish_reason": "length"}]}, "length"),
+            ({"choices": [{"finish_reason": "tool_calls"}]}, "tool_use"),
+            ({"choices": [{"finish_reason": "content_filter"}]}, "safety"),
+            ({"candidates": [{"finishReason": "STOP"}]}, "stop"),
+            ({"candidates": [{"finishReason": "MAX_TOKENS"}]}, "length"),
+            ({"candidates": [{"finishReason": "SAFETY"}]}, "safety"),
+            ({"candidates": [{"finishReason": "RECITATION"}]}, "safety"),
+            ({"done_reason": "stop"}, "stop"),
+            ({"done_reason": "length"}, "length"),
+            ({"stop_reason": "brand_new_reason"}, "other"),
+            ({"content": []}, None),
+            ({}, None),
+            (None, None),
+            ("not a dict", None),
+        ],
+    )
+    def test_shapes(self, response, expected):
+        assert extract_finish_reason(response) == expected
+
+
+class TestExtractResponseId:
+    """Response id extraction across the four id locations."""
+
+    @pytest.mark.parametrize(
+        "response,expected",
+        [
+            ({"id": "msg_01AbC"}, "msg_01AbC"),
+            ({"id": "chatcmpl-123"}, "chatcmpl-123"),
+            ({"responseId": "resp-xyz"}, "resp-xyz"),
+            ({"ResponseMetadata": {"RequestId": "req-aws-1"}}, "req-aws-1"),
+            ({"id": ""}, None),
+            ({}, None),
+            (None, None),
+        ],
+    )
+    def test_locations(self, response, expected):
+        assert extract_response_id(response) == expected
+
+
+class TestClassifyHttpError:
+    @pytest.mark.parametrize(
+        "status,expected",
+        [
+            (401, "auth"),
+            (403, "auth"),
+            (404, "not_found"),
+            (400, "bad_request"),
+            (429, "rate_limit"),
+            (529, "overloaded"),
+            (500, "server"),
+            (503, "server"),
+            (422, "other"),
+        ],
+    )
+    def test_mapping(self, status, expected):
+        assert _classify_http_error(status) == expected
+
+
+class TestResolveSource:
+    """Source identity resolution chain: entity -> path stem -> frigate -> none."""
+
+    def test_entity_wins(self):
+        call = SimpleNamespace(
+            image_entities=["camera.cam_garage"],
+            image_paths=["/config/www/blink/front_door_current.jpg"],
+        )
+        assert _resolve_source(call) == (
+            "camera.cam_garage",
+            "entity",
+            "camera.cam_garage",
+            None,
+        )
+
+    def test_image_path_stem(self):
+        """Path-based capture is first-class: the highest-volume live caller
+        passes file paths, not entities."""
+        call = SimpleNamespace(
+            image_paths=["/config/www/blink/front_door_current.jpg"]
+        )
+        source, kind, media, ev = _resolve_source(call)
+        assert source == "front_door_current"
+        assert kind == "path"
+        assert media == "/config/www/blink/front_door_current.jpg"
+        assert ev is None
+
+    def test_video_path_stem(self):
+        call = SimpleNamespace(video_paths=["/media/clips/backyard_0812.mp4"])
+        assert _resolve_source(call)[0] == "backyard_0812"
+
+    def test_frigate_event_id_is_not_a_source(self):
+        """Frigate ids are unbounded — carried separately, never as source."""
+        call = SimpleNamespace(event_id=["1723845600.123456-abc123"])
+        source, kind, media, ev = _resolve_source(call)
+        assert source is None
+        assert kind == "frigate_event"
+        assert ev == "1723845600.123456-abc123"
+
+    def test_none(self):
+        assert _resolve_source(SimpleNamespace()) == (None, "none", None, None)
+
+    def test_multi_source_first_wins(self):
+        call = SimpleNamespace(image_entities=["camera.a", "camera.b"])
+        assert _resolve_source(call)[0] == "camera.a"
+
+
+class TestUsageEventV2:
+    """v2 payload fields on llmvision_token_usage."""
+
+    def _provider(self, mock_hass):
+        with patch("custom_components.llmvision.providers.async_get_clientsession"):
+            return Anthropic(mock_hass, "test_key", "claude-sonnet-5")
+
+    def _vision_call(self, **overrides):
+        base = dict(
+            context=object(),
+            service_name="image_analyzer",
+            provider="entry_anthropic",
+            image_entities=["camera.cam_garage"],
+            message="Two-car garage. Are the cars present?",
+            base64_images=["b64a", "b64b"],
+            target_width=640,
+            max_tokens=60,
+            use_memory=False,
+            generate_title=True,
+            response_format="json",
+            sensor_entity="",
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_vision_adopt_captures_request_shape(self, mock_hass):
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+        provider._adopt_usage_attribution(self._vision_call())
+
+        provider._fire_usage_event(
+            {"usage": {"input_tokens": 100, "output_tokens": 10}}, latency_ms=1234
+        )
+
+        payload = mock_hass.bus.async_fire.call_args[0][1]
+        assert payload["schema"] == 2
+        assert payload["request_type"] == "vision"
+        assert payload["source"] == "camera.cam_garage"
+        assert payload["source_kind"] == "entity"
+        assert payload["frame_count"] == 2
+        assert payload["target_width"] == 640
+        assert payload["request_max_tokens"] == 60
+        assert payload["use_memory"] is False
+        assert payload["generate_title"] is True
+        assert payload["response_format"] == "json"
+        assert payload["fallback_from"] is None
+        assert payload["latency_ms"] == 1234
+        # sensor_entity "" normalizes to None
+        assert payload["target_entity"] is None
+
+    def test_prompt_hash_stable_and_bounded(self, mock_hass):
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+        provider._adopt_usage_attribution(self._vision_call())
+        h1 = provider._usage_request["prompt_hash"]
+        provider._adopt_usage_attribution(self._vision_call())
+        h2 = provider._usage_request["prompt_hash"]
+
+        assert h1 == h2
+        assert len(h1) == 12
+        assert int(h1, 16) >= 0  # hex
+        assert provider._usage_request["prompt_chars"] == len(
+            "Two-car garage. Are the cars present?"
+        )
+
+    @pytest.mark.asyncio
+    async def test_title_request_overrides(self, mock_hass):
+        """Title rows must not claim frames or a per-response prompt hash —
+        Request.call mutates call.message before title_request runs."""
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+        call = self._vision_call()
+        # Simulate Request.call's title flow: message overwritten with response
+        call.message = "Create a title for this text: A cat sat on the mat."
+        provider._prepare_text_data = Mock(return_value={"messages": []})
+        provider._make_request = AsyncMock(return_value="A title")
+
+        await provider.title_request(call)
+
+        req = provider._usage_request
+        assert req["request_type"] == "title"
+        assert req["frame_count"] == 0
+        assert req["prompt_hash"] is None
+        assert req["prompt_chars"] is None
+        assert req["request_max_tokens"] == 4096
+        assert call.max_tokens == 4096
+
+    def test_fallback_marker(self, mock_hass):
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+        call = self._vision_call()
+        call._fallback_of = "Anthropic"
+        provider._adopt_usage_attribution(call)
+
+        provider._fire_usage_event({"usage": {"input_tokens": 5, "output_tokens": 5}})
+
+        payload = mock_hass.bus.async_fire.call_args[0][1]
+        assert payload["fallback_from"] == "Anthropic"
+
+    def test_finish_reason_and_response_id_in_payload(self, mock_hass):
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+        provider._adopt_usage_attribution(self._vision_call())
+
+        provider._fire_usage_event(
+            {
+                "id": "msg_01XYZ",
+                "stop_reason": "max_tokens",
+                "usage": {"input_tokens": 50, "output_tokens": 60},
+            }
+        )
+
+        payload = mock_hass.bus.async_fire.call_args[0][1]
+        assert payload["finish_reason"] == "length"
+        assert payload["response_id"] == "msg_01XYZ"
+
+    @pytest.mark.asyncio
+    async def test_validate_request_type(self, mock_hass):
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(
+            return_value={
+                "usage": {"input_tokens": 8, "output_tokens": 2},
+                "content": [{"type": "text", "text": "Hi"}],
+            }
+        )
+        provider.session = Mock()
+        provider.session.post = AsyncMock(return_value=mock_response)
+
+        await provider.validate()
+
+        payload = mock_hass.bus.async_fire.call_args[0][1]
+        # v1 compat: service stays "validate"; v2 adds request_type
+        assert payload["service"] == "validate"
+        assert payload["request_type"] == "validate"
+
+    def test_v1_fields_unchanged(self, mock_hass):
+        """Backward compatibility: every v1 field keeps its exact semantics."""
+        mock_hass.bus = Mock()
+        mock_hass.data = {DOMAIN: {"entry_x": {CONF_PROVIDER: "OpenRouter"}}}
+        with patch("custom_components.llmvision.providers.async_get_clientsession"):
+            provider = OpenAI(mock_hass, "k", "google/gemma-3-4b-it:free")
+        provider._adopt_usage_attribution(
+            SimpleNamespace(provider="entry_x", service_name="image_analyzer")
+        )
+
+        provider._fire_usage_event(
+            {"usage": {"prompt_tokens": 700, "completion_tokens": 25}}
+        )
+
+        p = mock_hass.bus.async_fire.call_args[0][1]
+        assert p["provider"] == "OpenRouter"
+        assert p["config_entry_id"] == "entry_x"
+        assert p["service"] == "image_analyzer"
+        assert p["input_tokens"] == 700
+        assert p["output_tokens"] == 25
+        assert p["total_tokens"] == 725
+        assert p["cache_read_tokens"] == 0
+        assert p["reasoning_tokens"] == 0
+
+
+class TestErrorEvent:
+    """llmvision_call_error: fired on transport failures, never on success."""
+
+    def _provider(self, mock_hass):
+        with patch("custom_components.llmvision.providers.async_get_clientsession"):
+            return Anthropic(mock_hass, "test_key", "claude-sonnet-5")
+
+    @pytest.mark.asyncio
+    async def test_non_200_fires_error_event_then_raises(self, mock_hass):
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+        provider._adopt_usage_attribution(
+            SimpleNamespace(
+                provider="entry_a",
+                service_name="image_analyzer",
+                image_entities=["camera.cam_garage"],
+            )
+        )
+        mock_response = Mock()
+        mock_response.status = 429
+        mock_response.text = AsyncMock(
+            return_value='{"error": {"type": "rate_limit_error", "message": "slow down"}}'
+        )
+        provider.session = Mock()
+        provider.session.post = AsyncMock(return_value=mock_response)
+
+        with pytest.raises(ServiceValidationError):
+            await provider._post(url="https://example.test", headers={}, data={})
+
+        mock_hass.bus.async_fire.assert_called_once()
+        event_type, payload = mock_hass.bus.async_fire.call_args[0]
+        assert event_type == EVENT_CALL_ERROR
+        assert payload["schema"] == 1
+        assert payload["status_code"] == 429
+        assert payload["error_type"] == "rate_limit"
+        assert payload["source"] == "camera.cam_garage"
+        assert payload["request_type"] == "vision"
+        assert isinstance(payload["latency_ms"], int)
+        # never token counts or message content on error events
+        assert "input_tokens" not in payload
+        assert "prompt_hash" not in payload
+
+    @pytest.mark.asyncio
+    async def test_network_exception_fires_error_event_then_raises(self, mock_hass):
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+        provider.session = Mock()
+        provider.session.post = AsyncMock(side_effect=OSError("connection reset"))
+
+        with pytest.raises(ServiceValidationError):
+            await provider._post(url="https://example.test", headers={}, data={})
+
+        event_type, payload = mock_hass.bus.async_fire.call_args[0]
+        assert event_type == EVENT_CALL_ERROR
+        assert payload["status_code"] is None
+        assert payload["error_type"] == "network"
+
+    @pytest.mark.asyncio
+    async def test_error_event_failure_does_not_mask_original(self, mock_hass):
+        """A broken bus must not change which exception the caller sees."""
+        mock_hass.bus = Mock()
+        mock_hass.bus.async_fire = Mock(side_effect=RuntimeError("bus down"))
+        provider = self._provider(mock_hass)
+        provider.session = Mock()
+        provider.session.post = AsyncMock(side_effect=OSError("connection reset"))
+
+        with pytest.raises(ServiceValidationError, match="Request failed"):
+            await provider._post(url="https://example.test", headers={}, data={})
+
+    @pytest.mark.asyncio
+    async def test_no_error_event_on_success(self, mock_hass):
+        mock_hass.bus = Mock()
+        provider = self._provider(mock_hass)
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(
+            return_value={
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+                "content": [{"type": "text", "text": "ok"}],
+            }
+        )
+        provider.session = Mock()
+        provider.session.post = AsyncMock(return_value=mock_response)
+
+        await provider._post(url="https://example.test", headers={}, data={})
+
+        fired = [c[0][0] for c in mock_hass.bus.async_fire.call_args_list]
+        assert EVENT_CALL_ERROR not in fired
+        assert EVENT_TOKEN_USAGE in fired
+
+    @pytest.mark.asyncio
+    async def test_bedrock_error_event(self, mock_hass):
+        mock_hass.bus = Mock()
+        with patch("custom_components.llmvision.providers.async_get_clientsession"):
+            provider = AWSBedrock(
+                mock_hass,
+                aws_access_key_id="key",
+                aws_secret_access_key="secret",
+                aws_region_name="us-east-1",
+                model="us.amazon.nova-pro-v1:0",
+            )
+        bedrock_response = {
+            "ResponseMetadata": {"HTTPStatusCode": 500},
+        }
+        mock_client = Mock()
+        mock_hass.async_add_executor_job = AsyncMock(
+            side_effect=[mock_client, bedrock_response]
+        )
+
+        with pytest.raises(ServiceValidationError):
+            await provider.invoke_bedrock(model=provider.model, data={"messages": []})
+
+        event_type, payload = mock_hass.bus.async_fire.call_args[0]
+        assert event_type == EVENT_CALL_ERROR
+        assert payload["status_code"] == 500
+        assert payload["error_type"] == "server"
 
 
 if __name__ == "__main__":
