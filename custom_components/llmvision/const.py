@@ -51,6 +51,10 @@ CONF_MEMORY_STRINGS = "memory_strings"
 
 # Dispatcher signals
 SIGNAL_TIMELINE_UPDATED = f"{DOMAIN}_timeline_updated"
+# Per-entry usage signals (suffix with the config entry id): the native sensor
+# platform (sensor.py) listens on these; the bus events remain the public API.
+SIGNAL_TOKEN_USAGE = f"{DOMAIN}_token_usage_signal"
+SIGNAL_CALL_ERROR = f"{DOMAIN}_call_error_signal"
 
 
 # SERVICE CALL CONSTANTS

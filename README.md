@@ -105,7 +105,11 @@ Failed calls fire a separate `llmvision_call_error` event (transport-level: non-
 
 Note that events also fire when you save a provider in the setup flow (`service: validate`), because that performs a real API call, and that `generate_title` produces a second event for the title request (`request_type: title`).
 
-A trigger-based template sensor is the simplest way to accumulate totals:
+### Native sensors
+
+Since fork build 1.7.1.3, every provider config entry also creates a device with native sensors — no YAML required: **Input tokens**, **Output tokens**, **Cached tokens** (`total_increasing` counters with long-term statistics), **API calls** (billed successes only), **API errors** (transport failures), and **Last latency**. Counts are per provider entry by construction and survive restarts. Validation calls made from the setup flow before the entry exists are not counted. Cost is deliberately not computed here: providers don't report pricing, so cost tracking stays in user configuration built on the events below.
+
+A trigger-based template sensor is the simplest way to accumulate totals across all providers (or to enrich events with pricing):
 
 ```yaml
 template:

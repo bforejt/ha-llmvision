@@ -144,6 +144,11 @@ async def async_setup_entry(hass, entry):
         await hass.config_entries.async_forward_entry_setups(entry, ["calendar"])
         timeline = Timeline(hass, entry)
         await timeline._cleanup()
+    elif filtered_provider_config.get(CONF_PROVIDER):
+        # Provider entries get native token-usage sensors (sensor.py): a
+        # device with per-provider token/call/error counters, updated via
+        # entry-scoped dispatcher signals from the transport layer.
+        await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
 
     # Sanitize provider config (remove api_key and value)
     sanitized_provider_config = {
@@ -182,6 +187,14 @@ async def async_unload_entry(hass, entry) -> bool:
         # unload the calendar
         unload_ok = await hass.config_entries.async_unload_platforms(
             entry, ["calendar"]
+        )
+    elif (
+        entry.data.get(CONF_PROVIDER)
+        and entry.data.get(CONF_PROVIDER) != "Settings"
+    ):
+        # Provider entries carry the token-usage sensor platform
+        unload_ok = await hass.config_entries.async_unload_platforms(
+            entry, ["sensor"]
         )
     else:
         unload_ok = True

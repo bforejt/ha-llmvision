@@ -4,6 +4,7 @@ import boto3
 from botocore.exceptions import ClientError
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.core import HomeAssistant
 from functools import partial
 from typing import Any, cast
@@ -43,6 +44,8 @@ from .const import (
     ENDPOINT_MISTRAL,
     EVENT_TOKEN_USAGE,
     EVENT_CALL_ERROR,
+    SIGNAL_TOKEN_USAGE,
+    SIGNAL_CALL_ERROR,
     ERROR_NOT_CONFIGURED,
     ERROR_GROQ_MULTIPLE_IMAGES,
     ERROR_NO_IMAGE_INPUT,
@@ -875,29 +878,39 @@ class Provider(ABC):
                 if self._usage_entry_id
                 else None
             )
+            payload = {
+                "schema": 2,
+                "provider": provider_name or self.__class__.__name__,
+                "config_entry_id": self._usage_entry_id,
+                "model": (
+                    response.get("model")
+                    if isinstance(response, dict)
+                    and isinstance(response.get("model"), str)
+                    else self.model
+                ),
+                "service": self._usage_service,
+                **usage,
+                **{**_USAGE_REQUEST_DEFAULTS, **self._usage_request},
+                "latency_ms": latency_ms,
+                "finish_reason": extract_finish_reason(response),
+                "response_id": extract_response_id(response),
+            }
             self.hass.bus.async_fire(
                 EVENT_TOKEN_USAGE,
-                {
-                    "schema": 2,
-                    "provider": provider_name or self.__class__.__name__,
-                    "config_entry_id": self._usage_entry_id,
-                    "model": (
-                        response.get("model")
-                        if isinstance(response, dict)
-                        and isinstance(response.get("model"), str)
-                        else self.model
-                    ),
-                    "service": self._usage_service,
-                    **usage,
-                    **{**_USAGE_REQUEST_DEFAULTS, **self._usage_request},
-                    "latency_ms": latency_ms,
-                    "finish_reason": extract_finish_reason(response),
-                    "response_id": extract_response_id(response),
-                },
+                payload,
                 # Inheriting the caller's context lets HA chain the event back
                 # to the automation or script that triggered the call.
                 context=self._usage_context,
             )
+            # Update the entry's native sensors (sensor.py). Entry-scoped so
+            # only the provider that made the call counts it; validate calls
+            # from the config flow have no entry id yet and are skipped.
+            if self._usage_entry_id:
+                async_dispatcher_send(
+                    self.hass,
+                    f"{SIGNAL_TOKEN_USAGE}_{self._usage_entry_id}",
+                    payload,
+                )
         except Exception as e:  # noqa: BLE001 - telemetry is best-effort
             _LOGGER.debug(f"Could not fire {EVENT_TOKEN_USAGE} event: {e}")
 
@@ -922,24 +935,32 @@ class Provider(ABC):
                 else None
             )
             req = {**_USAGE_REQUEST_DEFAULTS, **self._usage_request}
+            payload = {
+                "schema": 1,
+                "provider": provider_name or self.__class__.__name__,
+                "config_entry_id": self._usage_entry_id,
+                "model": self.model,
+                "service": self._usage_service,
+                "request_type": req["request_type"],
+                "source": req["source"],
+                "source_kind": req["source_kind"],
+                "fallback_from": req["fallback_from"],
+                "status_code": status_code,
+                "error_type": error_type,
+                "latency_ms": latency_ms,
+            }
             self.hass.bus.async_fire(
                 EVENT_CALL_ERROR,
-                {
-                    "schema": 1,
-                    "provider": provider_name or self.__class__.__name__,
-                    "config_entry_id": self._usage_entry_id,
-                    "model": self.model,
-                    "service": self._usage_service,
-                    "request_type": req["request_type"],
-                    "source": req["source"],
-                    "source_kind": req["source_kind"],
-                    "fallback_from": req["fallback_from"],
-                    "status_code": status_code,
-                    "error_type": error_type,
-                    "latency_ms": latency_ms,
-                },
+                payload,
                 context=self._usage_context,
             )
+            # Entry-scoped error signal for the native error counter sensor.
+            if self._usage_entry_id:
+                async_dispatcher_send(
+                    self.hass,
+                    f"{SIGNAL_CALL_ERROR}_{self._usage_entry_id}",
+                    payload,
+                )
         except Exception as e:  # noqa: BLE001 - telemetry is best-effort
             _LOGGER.debug(f"Could not fire {EVENT_CALL_ERROR} event: {e}")
 
