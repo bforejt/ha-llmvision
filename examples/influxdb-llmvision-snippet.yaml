@@ -1,0 +1,79 @@
+# InfluxDB configuration for LLM Vision usage data (fork >= 1.7.1.2)
+# ===================================================================
+# MERGE these keys into your existing influxdb configuration — do not paste
+# this file wholesale, or you will replace whatever filtering you already have.
+#
+# Applying changes: the influxdb integration reads YAML once at config-entry
+# setup and registers NO reload service ("Reload all YAML configuration" does
+# not touch it). To apply an edit:
+#   Settings -> Devices & Services -> InfluxDB -> (three-dot menu) -> Reload
+# (or call homeassistant.reload_config_entry on the entry). No restart needed.
+#
+# This assumes the companion package (llmvision_token_usage.yaml) is
+# installed: it is the package's cost-ledger sensor whose attributes are
+# being turned into tags below.
+
+# Per-event dimensions -> Influx TAGS, i.e. GROUP BY dimensions in Grafana
+# (spend per provider / model / service / camera, error rates by type).
+# tags_attributes matches by attribute NAME across ALL included entities —
+# the llm_ prefix exists so a bare `model`/`provider` attribute on some
+# unrelated entity doesn't get swept in. Only bounded, low-cardinality
+# values belong here. Do NOT add context_id/context_parent/prompt_hash/
+# response_id: per-call unique values as tags explode series cardinality;
+# they stay fields.
+tags_attributes:
+  - llm_provider
+  - llm_model
+  - llm_service
+  - llm_source
+  - llm_request_type
+  - llm_finish_reason
+  - llm_error_type
+
+# Without an override, entities land in a measurement named after their UNIT
+# ("tokens", "USD", ...) shared with unrelated entities. Give the LLM Vision
+# series their own measurement instead. All package sensors share the
+# sensor.llm_vision_ prefix, so one glob covers them.
+component_config_glob:
+  sensor.llm_vision_*:
+    override_measurement: llm_vision
+
+# Example query — 30-day spend per camera:
+#   SELECT sum("call_cost") FROM "llm_vision"
+#   WHERE time > now() - 30d GROUP BY "llm_source"
+# The ledger rows store tokens AND the rates used per event, so cost can
+# also be recomputed later with a different formula (cache discounts etc.).
+
+include:
+  entities:
+    # Only needed if your filter does NOT already include the sensor domain
+    # broadly. include.entities has the highest precedence, so these also
+    # punch through any exclude globs.
+    - sensor.llm_vision_input_tokens
+    - sensor.llm_vision_output_tokens
+    - sensor.llm_vision_cached_tokens
+    - sensor.llm_vision_api_calls
+    - sensor.llm_vision_api_errors
+    - sensor.llm_vision_cost
+
+exclude:
+  entities:
+    # The rolling last-5 window sensor. Harmless but noisy in Influx: its
+    # list-of-dicts attribute is str()-ified into a large field on every
+    # event. Skip it; the same detail is already in the ledger rows.
+    - sensor.llm_vision_last_call
+
+    # Native per-provider sensors (fork >= 1.7.1.3). The integration creates
+    # six sensors per provider config entry, named from the entry TITLE
+    # (e.g. sensor.anthropic_claude_input_tokens). They exist for the HA UI
+    # and long-term statistics; in Influx they are redundant — the ledger
+    # rows reproduce per-provider totals via GROUP BY llm_provider — and
+    # without an override they'd scatter into unit-named measurements.
+    # List YOUR entries' sensors here; remember to update this list when a
+    # provider entry is added or retitled.
+    #- sensor.<your_entry_title>_input_tokens
+    #- sensor.<your_entry_title>_output_tokens
+    #- sensor.<your_entry_title>_cached_tokens
+    #- sensor.<your_entry_title>_api_calls
+    #- sensor.<your_entry_title>_api_errors
+    #- sensor.<your_entry_title>_last_latency

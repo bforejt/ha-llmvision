@@ -1,0 +1,48 @@
+{#
+  LLM Vision per-model pricing table — THE single place rates are defined.
+  Place at: /config/custom_templates/llmvision_rates.jinja
+  Reload after editing: Developer Tools -> YAML -> "Custom Jinja2 templates"
+  (service: homeassistant.reload_custom_templates). No restart needed.
+
+  Returns "input_rate,output_rate,source" (USD per million tokens):
+    source = "table"    -> model has an explicit entry below
+    source = "fallback" -> model unknown; priced at the default helpers, and
+                           the "unknown model" automation raises a notification
+
+  Conventions:
+  - claude-sonnet-5 (the primary model) deliberately references the two
+    input_number helpers instead of literals, so the scheduled 2026-09-01
+    rate-change automation (which updates the helpers) flows through here
+    automatically. Other models are literals: edit this file, then reload.
+  - Keyed by model only. If a provider is ever added where the SAME model id
+    has different pricing (e.g. OpenRouter vs OpenAI direct), the key must
+    become provider|model — the llm_provider attribute is already in every
+    ledger row to support that split.
+  - Matching is LONGEST PREFIX, not exact: providers report dated variants
+    ('claude-haiku-4-5-20251001', 'gpt-4o-2024-08-06') that price the same
+    as the base model. Longest-prefix means a more specific key (e.g. a
+    differently-priced '-mini' variant) can be added later and win over the
+    base entry. Discovered 2026-08-16: a dated Haiku id fell through exact
+    matching to fallback and one ledger row overpriced at 2/10 instead of
+    1/5 (disclosed, not corrected).
+  - Rates below verified 2026-08-16 (Anthropic list prices). Do not add
+    models from memory — check the provider's pricing page first; a wrong
+    rate here is stamped into ledger rows permanently.
+#}
+{%- macro rates(model) -%}
+{%- set fb = (states('input_number.llm_vision_rate_input_per_mtok') | float(0) | string)
+     ~ ',' ~ (states('input_number.llm_vision_rate_output_per_mtok') | float(0) | string) -%}
+{%- set table = {
+  'claude-sonnet-5': fb ~ ',table',
+  'claude-haiku-4-5': '1.00,5.00,table',
+  'claude-opus-5': '5.00,25.00,table'
+} -%}
+{%- set hit = namespace(val=none, klen=0) -%}
+{%- for k, v in table.items() -%}
+  {%- if model.startswith(k) and (k | length) > hit.klen -%}
+    {%- set hit.val = v -%}
+    {%- set hit.klen = k | length -%}
+  {%- endif -%}
+{%- endfor -%}
+{{- hit.val if hit.val is not none else fb ~ ',fallback' -}}
+{%- endmacro -%}

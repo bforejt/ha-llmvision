@@ -1,0 +1,226 @@
+# LLM Vision token usage — Home Assistant package
+#
+# Place at: /config/packages/llmvision_token_usage.yaml
+# Requires the fork build (>= 1.7.1.1), which fires `llmvision_token_usage`.
+#
+# Trigger-based template entities are YAML-only (the UI Template Helper cannot
+# use triggers), which is why this is a package rather than a UI helper.
+#
+# Reload after editing:  Developer Tools -> YAML -> "Template entities"
+# (or Actions -> template.reload). No Home Assistant restart required.
+
+template:
+  - triggers:
+      - trigger: event
+        event_type: llmvision_token_usage
+
+    sensor:
+      # ---- Running totals -------------------------------------------------
+      # `this.state` is the sensor's own previous value; it is `unknown` on the
+      # very first event, which `| int(0)` absorbs. Trigger-based template
+      # entities restore their state across restarts, so these survive reboots.
+      - name: "LLM Vision Input Tokens"
+        unique_id: llmvision_input_tokens_total
+        state: "{{ (this.state | int(0)) + (trigger.event.data.input_tokens | int(0)) }}"
+        state_class: total_increasing
+        unit_of_measurement: tokens
+        icon: mdi:import
+
+      - name: "LLM Vision Output Tokens"
+        unique_id: llmvision_output_tokens_total
+        state: "{{ (this.state | int(0)) + (trigger.event.data.output_tokens | int(0)) }}"
+        state_class: total_increasing
+        unit_of_measurement: tokens
+        icon: mdi:export
+
+      # Cached input is a SUBSET of input_tokens, tracked separately because it
+      # bills at a discounted rate. Never add it on top of the input total.
+      - name: "LLM Vision Cached Tokens"
+        unique_id: llmvision_cached_tokens_total
+        state: "{{ (this.state | int(0)) + (trigger.event.data.cache_read_tokens | int(0)) }}"
+        state_class: total_increasing
+        unit_of_measurement: tokens
+        icon: mdi:database-arrow-down
+
+      - name: "LLM Vision API Calls"
+        unique_id: llmvision_api_calls_total
+        state: "{{ (this.state | int(0)) + 1 }}"
+        state_class: total_increasing
+        unit_of_measurement: calls
+        icon: mdi:counter
+
+      # ---- Per-event cost ledger + frozen-rate accumulator ----------------
+      # State: lifetime cost, accumulated one event at a time with the rates
+      # in effect AT THAT MOMENT. Changing a rate helper affects only future
+      # events — history stays frozen (unlike the old retroactive UI helper,
+      # which repriced everything on a rate change).
+      #
+      # Attributes: the full enriched record for THIS event — tokens, the
+      # rates used, and the computed cost. Every state write fans out to:
+      #   - HA recorder (full row, ~10 days)
+      #   - HA long-term statistics (hourly cost curve, forever, via
+      #     state_class: total)
+      #   - InfluxDB (full row, forever; llm_provider/llm_model/llm_service
+      #     become TAGS via tags_attributes in influxdb.yaml)
+      # Because tokens AND rates are stored per row, `call_cost` is a
+      # convenience — cost can be recomputed later in Grafana if a provider's
+      # billing formula changes (cache discounts etc.).
+      #
+      # Seeding: on the very first event, this.state is 'unknown' and the
+      # accumulator seeds from the retroactive cost sensor. Valid only while
+      # ALL history was billed at one rate — true until 2026-08-31 (intro
+      # pricing). Deploy before then. After seeding is confirmed, the UI
+      # helper sensor.llm_vision_estimated_cost is deleted; the fallback then
+      # degrades to 0, which only matters if state restore ever fails.
+      # Rates come from custom_templates/llmvision_rates.jinja — per-model
+      # table with the two input_number helpers as fallback. `with context`
+      # on every import is REQUIRED: without it the macro cannot call
+      # states() and every event silently prices at 0.
+      # (Seeding note: the original `| float(<seed>)` fallback to the old UI
+      # helper is gone — the seed was consumed 2026-08-16 and the helper
+      # deleted. If restore ever fails, the accumulator restarts at 0; the
+      # true total remains recoverable from InfluxDB.)
+      - name: "LLM Vision Cost"
+        unique_id: llmvision_cost_total
+        state: >-
+          {%- from 'llmvision_rates.jinja' import rates with context -%}
+          {%- set r = rates(trigger.event.data.model | string).split(',') -%}
+          {%- set cost = (trigger.event.data.input_tokens | int(0)) / 1000000 * (r[0] | float(0))
+                       + (trigger.event.data.output_tokens | int(0)) / 1000000 * (r[1] | float(0)) -%}
+          {{ ((this.state | float(0)) + cost) | round(6) }}
+        unit_of_measurement: USD
+        device_class: monetary
+        state_class: total
+        icon: mdi:cash-register
+        attributes:
+          # llm_ prefix is deliberate: tags_attributes in influxdb.yaml is
+          # matched globally by attribute NAME, and a bare `model`/`provider`
+          # attribute exists on other entities. Do not rename these without
+          # updating influxdb.yaml to match.
+          llm_provider: "{{ trigger.event.data.provider }}"
+          llm_model: "{{ trigger.event.data.model }}"
+          llm_service: "{{ trigger.event.data.service | default('unknown', true) }}"
+          input_tokens: "{{ trigger.event.data.input_tokens | int(0) }}"
+          output_tokens: "{{ trigger.event.data.output_tokens | int(0) }}"
+          cache_read_tokens: "{{ trigger.event.data.cache_read_tokens | int(0) }}"
+          cache_write_tokens: "{{ trigger.event.data.cache_write_tokens | int(0) }}"
+          reasoning_tokens: "{{ trigger.event.data.reasoning_tokens | int(0) }}"
+          rate_input_per_mtok: >-
+            {%- from 'llmvision_rates.jinja' import rates with context -%}
+            {{ rates(trigger.event.data.model | string).split(',')[0] | float(0) }}
+          rate_output_per_mtok: >-
+            {%- from 'llmvision_rates.jinja' import rates with context -%}
+            {{ rates(trigger.event.data.model | string).split(',')[1] | float(0) }}
+          # "table" = explicit per-model entry; "fallback" = unknown model
+          # priced at the default helpers (fires the alert automation).
+          rate_source: >-
+            {%- from 'llmvision_rates.jinja' import rates with context -%}
+            {{ rates(trigger.event.data.model | string).split(',')[2] }}
+          call_cost: >-
+            {%- from 'llmvision_rates.jinja' import rates with context -%}
+            {%- set r = rates(trigger.event.data.model | string).split(',') -%}
+            {{ ((trigger.event.data.input_tokens | int(0)) / 1000000 * (r[0] | float(0))
+              + (trigger.event.data.output_tokens | int(0)) / 1000000 * (r[1] | float(0))) | round(6) }}
+          # Unbounded per-call ULID: stays a FIELD in Influx (never add it to
+          # tags_attributes — unbounded tag values explode series cardinality).
+          context_parent: "{{ trigger.event.context.parent_id }}"
+          # This service-call run's own context id: the join key that groups
+          # vision+title+retry events of one call, and counts attempts per
+          # automation run (count distinct context_id GROUP BY context_parent).
+          context_id: "{{ trigger.event.context.id }}"
+          # ---- v2 (schema 2, fork >= 1.7.1.2) ----
+          # Bounded dimensions get the llm_ prefix and become Influx TAGS via
+          # tags_attributes; defaults keep tag values non-null for grouping.
+          llm_source: "{{ trigger.event.data.source | default('none', true) }}"
+          llm_request_type: "{{ trigger.event.data.request_type | default('unknown', true) }}"
+          llm_finish_reason: "{{ trigger.event.data.finish_reason | default('none', true) }}"
+          # Unbounded / high-cardinality: fields only.
+          latency_ms: "{{ trigger.event.data.latency_ms | default(none) }}"
+          media: "{{ trigger.event.data.media | default(none) }}"
+          prompt_hash: "{{ trigger.event.data.prompt_hash | default(none) }}"
+          frame_count: "{{ trigger.event.data.frame_count | default(none) }}"
+          response_id: "{{ trigger.event.data.response_id | default(none) }}"
+
+      # ---- Most recent call, plus a rolling window of the last 5 ----------
+      - name: "LLM Vision Last Call"
+        unique_id: llmvision_last_call
+        state: "{{ trigger.event.data.total_tokens | int(0) }}"
+        unit_of_measurement: tokens
+        icon: mdi:history
+        attributes:
+          provider: "{{ trigger.event.data.provider }}"
+          model: "{{ trigger.event.data.model }}"
+          service: "{{ trigger.event.data.service }}"
+          config_entry_id: "{{ trigger.event.data.config_entry_id }}"
+          input_tokens: "{{ trigger.event.data.input_tokens | int(0) }}"
+          output_tokens: "{{ trigger.event.data.output_tokens | int(0) }}"
+          cached_tokens: "{{ trigger.event.data.cache_read_tokens | int(0) }}"
+          reasoning_tokens: "{{ trigger.event.data.reasoning_tokens | int(0) }}"
+          # Context chain back to the automation/script that made the call
+          context_parent: "{{ trigger.event.context.parent_id }}"
+          # Rolling list of the last 5 calls, newest first. Reads its own prior
+          # value, prepends the new entry, and truncates — keep the window
+          # small, since attributes are written to the recorder on every event.
+          recent: >-
+            {%- set prior = this.attributes.get('recent', []) if this.attributes is defined else [] -%}
+            {%- set entry = {
+                  'ts': now().strftime('%m-%d %H:%M:%S'),
+                  'provider': trigger.event.data.provider,
+                  'model': trigger.event.data.model,
+                  'service': trigger.event.data.service,
+                  'src': trigger.event.data.source | default(none, true),
+                  'ms': trigger.event.data.latency_ms | default(none),
+                  'in': trigger.event.data.input_tokens | int(0),
+                  'out': trigger.event.data.output_tokens | int(0),
+                  'total': trigger.event.data.total_tokens | int(0),
+                  'cached': trigger.event.data.cache_read_tokens | int(0),
+                  'reasoning': trigger.event.data.reasoning_tokens | int(0)
+                } -%}
+            {{ ([entry] + prior)[:5] }}
+
+  # ---- Failed calls (fork >= 1.7.1.2) ---------------------------------------
+  # llmvision_call_error fires on transport failures (non-200, network,
+  # failed body reads) — deliberately a SEPARATE stream from billed usage, so
+  # sensor.llm_vision_api_calls keeps meaning "billed successes only".
+  - triggers:
+      - trigger: event
+        event_type: llmvision_call_error
+
+    sensor:
+      - name: "LLM Vision API Errors"
+        unique_id: llmvision_api_errors_total
+        state: "{{ (this.state | int(0)) + 1 }}"
+        state_class: total_increasing
+        unit_of_measurement: errors
+        icon: mdi:alert-circle-outline
+        attributes:
+          llm_provider: "{{ trigger.event.data.provider }}"
+          llm_request_type: "{{ trigger.event.data.request_type | default('unknown', true) }}"
+          # Bounded enum (auth/not_found/bad_request/rate_limit/overloaded/
+          # server/network/other) -> Influx tag via tags_attributes.
+          llm_error_type: "{{ trigger.event.data.error_type | default('other', true) }}"
+          llm_source: "{{ trigger.event.data.source | default('none', true) }}"
+          status_code: "{{ trigger.event.data.status_code | default(none) }}"
+          latency_ms: "{{ trigger.event.data.latency_ms | default(none) }}"
+          fallback_from: "{{ trigger.event.data.fallback_from | default(none) }}"
+          context_parent: "{{ trigger.event.context.parent_id }}"
+          context_id: "{{ trigger.event.context.id }}"
+
+# ---- Daily / monthly cycles ------------------------------------------------
+# Optional. Current HA best practice is to create utility meters through the UI
+# (Settings -> Devices & Services -> Helpers -> Utility Meter), since they are
+# config-flow helpers. Kept here in YAML for consistency with the existing
+# energy configuration on this system — use one approach, not both.
+utility_meter:
+  llmvision_input_tokens_daily:
+    source: sensor.llm_vision_input_tokens
+    cycle: daily
+  llmvision_output_tokens_daily:
+    source: sensor.llm_vision_output_tokens
+    cycle: daily
+  llmvision_input_tokens_monthly:
+    source: sensor.llm_vision_input_tokens
+    cycle: monthly
+  llmvision_output_tokens_monthly:
+    source: sensor.llm_vision_output_tokens
+    cycle: monthly
