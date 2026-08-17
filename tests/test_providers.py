@@ -3002,9 +3002,10 @@ class TestUsageEvent:
             )
 
         bedrock_response = {
-            "ResponseMetadata": {"HTTPStatusCode": 200},
+            "ResponseMetadata": {"HTTPStatusCode": 200, "RequestId": "req-aws-1"},
             "metrics": {"latencyMs": 5},
             "usage": {"inputTokens": 40, "outputTokens": 8, "totalTokens": 48},
+            "stopReason": "end_turn",
             "output": {"message": {"content": [{"text": "ok"}]}},
         }
         mock_client = Mock()
@@ -3024,6 +3025,11 @@ class TestUsageEvent:
         assert payload["total_tokens"] == 48
         # Bedrock responses carry no "model" string; configured model is used
         assert payload["model"] == "us.amazon.nova-pro-v1:0"
+        # v2 metadata pinned: wall-clock latency (NOT server-side metrics
+        # latencyMs), normalized stopReason, ResponseMetadata request id
+        assert isinstance(payload["latency_ms"], int)
+        assert payload["finish_reason"] == "stop"
+        assert payload["response_id"] == "req-aws-1"
 
     @pytest.mark.asyncio
     async def test_vision_request_wires_attribution_end_to_end(self, mock_hass):
@@ -3462,23 +3468,62 @@ class TestErrorEvent:
         assert EVENT_CALL_ERROR not in fired
         assert EVENT_TOKEN_USAGE in fired
 
-    @pytest.mark.asyncio
-    async def test_bedrock_error_event(self, mock_hass):
-        mock_hass.bus = Mock()
+    def _bedrock(self, mock_hass):
         with patch("custom_components.llmvision.providers.async_get_clientsession"):
-            provider = AWSBedrock(
+            return AWSBedrock(
                 mock_hass,
                 aws_access_key_id="key",
                 aws_secret_access_key="secret",
                 aws_region_name="us-east-1",
                 model="us.amazon.nova-pro-v1:0",
             )
-        bedrock_response = {
-            "ResponseMetadata": {"HTTPStatusCode": 500},
-        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "code,status,expected_type",
+        [
+            ("ThrottlingException", 429, "rate_limit"),
+            ("AccessDeniedException", 403, "auth"),
+            ("ValidationException", 400, "bad_request"),
+            ("InternalServerException", 500, "server"),
+        ],
+    )
+    async def test_bedrock_client_error_classified(
+        self, mock_hass, code, status, expected_type
+    ):
+        """boto3 raises ClientError for EVERY non-2xx converse outcome — it
+        never returns an error-status dict. Classification must come from the
+        exception's ResponseMetadata (dead-branch bug caught in review)."""
+        from botocore.exceptions import ClientError as BotoClientError
+
+        mock_hass.bus = Mock()
+        provider = self._bedrock(mock_hass)
+        err = BotoClientError(
+            {
+                "Error": {"Code": code, "Message": "denied"},
+                "ResponseMetadata": {"HTTPStatusCode": status},
+            },
+            "Converse",
+        )
+        mock_client = Mock()
+        mock_hass.async_add_executor_job = AsyncMock(side_effect=[mock_client, err])
+
+        with pytest.raises(ServiceValidationError):
+            await provider.invoke_bedrock(model=provider.model, data={"messages": []})
+
+        event_type, payload = mock_hass.bus.async_fire.call_args[0]
+        assert event_type == EVENT_CALL_ERROR
+        assert payload["status_code"] == status
+        assert payload["error_type"] == expected_type
+        assert isinstance(payload["latency_ms"], int)
+
+    @pytest.mark.asyncio
+    async def test_bedrock_transport_exception_is_network(self, mock_hass):
+        mock_hass.bus = Mock()
+        provider = self._bedrock(mock_hass)
         mock_client = Mock()
         mock_hass.async_add_executor_job = AsyncMock(
-            side_effect=[mock_client, bedrock_response]
+            side_effect=[mock_client, ConnectionError("unreachable")]
         )
 
         with pytest.raises(ServiceValidationError):
@@ -3486,8 +3531,78 @@ class TestErrorEvent:
 
         event_type, payload = mock_hass.bus.async_fire.call_args[0]
         assert event_type == EVENT_CALL_ERROR
-        assert payload["status_code"] == 500
-        assert payload["error_type"] == "server"
+        assert payload["status_code"] is None
+        assert payload["error_type"] == "network"
+
+    @pytest.mark.asyncio
+    async def test_body_read_failure_fires_error_event(self, mock_hass):
+        """200 headers + failed body read (lazy aiohttp read) must still emit
+        an error event — previously fired neither usage nor error."""
+        with patch("custom_components.llmvision.providers.async_get_clientsession"):
+            provider = Anthropic(mock_hass, "test_key", "claude-sonnet-5")
+        mock_hass.bus = Mock()
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(side_effect=TimeoutError("body read timed out"))
+        provider.session = Mock()
+        provider.session.post = AsyncMock(return_value=mock_response)
+
+        with pytest.raises(ServiceValidationError):
+            await provider._post(url="https://example.test", headers={}, data={})
+
+        event_type, payload = mock_hass.bus.async_fire.call_args[0]
+        assert event_type == EVENT_CALL_ERROR
+        assert payload["status_code"] == 200
+        assert payload["error_type"] == "network"
+
+
+class TestFallbackPlumbing:
+    """End-to-end: Request.call must stamp the FAILED provider's configured
+    name into call._fallback_of before the fallback retry."""
+
+    @pytest.mark.asyncio
+    async def test_fallback_marker_carries_primary_name(self, mock_hass):
+        from custom_components.llmvision.providers import ProviderFactory
+
+        mock_hass.bus = Mock()
+        mock_hass.data = {
+            DOMAIN: {
+                "entry_primary": {CONF_PROVIDER: "Anthropic"},
+                "entry_fallback": {CONF_PROVIDER: "OpenAI"},
+            }
+        }
+        settings = Mock()
+        settings.data = {"provider": "Settings", "fallback_provider": "entry_fallback"}
+        mock_hass.config_entries.async_entries = Mock(return_value=[settings])
+
+        call = SimpleNamespace(
+            provider="entry_primary",
+            model="claude-sonnet-5",
+            message="check the garage",
+            response_format="text",
+            generate_title=False,
+            title_field="",
+            model_is_glimpse=lambda: False,
+        )
+
+        failing = Mock()
+        failing.vision_request = AsyncMock(side_effect=RuntimeError("boom"))
+        succeeding = Mock()
+        succeeding.vision_request = AsyncMock(return_value="a cat")
+
+        with patch("custom_components.llmvision.providers.async_get_clientsession"):
+            request = Request(mock_hass, message="m", max_tokens=10, temperature=0.5)
+
+        with patch.object(
+            ProviderFactory, "create", side_effect=[failing, succeeding]
+        ), patch.object(Request, "validate"):
+            result = await request.call(call)
+
+        # The marker carries the PRIMARY's configured name, set before the
+        # retry overwrote call.provider — a wrong-name mutation fails here.
+        assert call._fallback_of == "Anthropic"
+        assert call.provider == "entry_fallback"
+        assert result["response_text"] == "a cat"
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from aiohttp import ClientTimeout
 import boto3
+from botocore.exceptions import ClientError
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.core import HomeAssistant
@@ -540,6 +541,11 @@ class Request:
                     pass
             # For non-structured output, use traditional title generation
             elif call.generate_title and call.response_format != "json":
+                # Stash the original prompt: the title-failure fallback below
+                # re-runs the WHOLE call, and without restoration the fallback
+                # vision request would analyze against this title prompt and
+                # stamp a garbage per-response prompt_hash on its usage row.
+                call._pre_title_message = call.message
                 call.message = (
                     call.memory.title_prompt
                     + "Create a title for this text: "
@@ -557,6 +563,11 @@ class Request:
             ):
                 _LOGGER.info(f"Trying fallback provider for title: {fallback_provider}")
                 call._fallback_of = provider_name
+                # Restore the original prompt so the fallback's vision request
+                # analyzes the user's message, not the title prompt (also
+                # fixes the fallback re-analysis using the wrong prompt).
+                if hasattr(call, "_pre_title_message"):
+                    call.message = call._pre_title_message
                 call.provider = fallback_provider
                 call.model = None
                 return await self.call(call, _is_fallback_retry=True)
@@ -993,7 +1004,19 @@ class Provider(ABC):
             )
             raise ServiceValidationError(parsed_response)
         else:
-            response_data = await response.json()
+            try:
+                response_data = await response.json()
+            except Exception as e:
+                # Headers arrived OK but the body read/parse failed — a
+                # total-timeout expiry or connection reset lands HERE, not in
+                # the session.post() try (aiohttp reads the body lazily).
+                # status_code 200 + error_type network is the honest record.
+                self._fire_error_event(
+                    status_code=200,
+                    error_type="network",
+                    latency_ms=int((perf_counter() - start) * 1000),
+                )
+                raise ServiceValidationError(f"Request failed: {e}")
             # Wall-clock request -> body parsed, uniform across providers
             latency_ms = int((perf_counter() - start) * 1000)
             _LOGGER.debug(f"Response data: {response_data}")
@@ -2453,7 +2476,6 @@ class AWSBedrock(Provider):
         """Post data to url and return response data"""
         _LOGGER.debug(f"AWS Bedrock request data: {Request.sanitize_data(data)}")
 
-        start = perf_counter()
         try:
             _LOGGER.info(f"Invoking Bedrock model {model} in {self.aws_region}")
             client = await self.hass.async_add_executor_job(
@@ -2465,27 +2487,59 @@ class AWSBedrock(Provider):
                     aws_secret_access_key=self.aws_secret_access_key,
                 )
             )
+        except Exception as e:
+            # Client construction — credentials/config problem, no API call
+            # was made, so no latency to report.
+            self._fire_error_event(
+                status_code=None, error_type="network", latency_ms=None
+            )
+            raise ServiceValidationError(f"Request failed: {e}")
 
-            # Invoke the model with the response stream
-            converse_kwargs = {
-                "modelId": model,
-                "messages": data.get("messages"),
-                "inferenceConfig": data.get("inferenceConfig"),
-            }
+        # Invoke the model with the response stream
+        converse_kwargs = {
+            "modelId": model,
+            "messages": data.get("messages"),
+            "inferenceConfig": data.get("inferenceConfig"),
+        }
 
-            # Add toolConfig if present (for structured output)
-            if "toolConfig" in data:
-                converse_kwargs["toolConfig"] = data.get("toolConfig")
+        # Add toolConfig if present (for structured output)
+        if "toolConfig" in data:
+            converse_kwargs["toolConfig"] = data.get("toolConfig")
 
-            # Add system prompt if present (for structured output)
-            if "system" in data:
-                converse_kwargs["system"] = data.get("system")
+        # Add system prompt if present (for structured output)
+        if "system" in data:
+            converse_kwargs["system"] = data.get("system")
 
+        # Timer starts at the API call, after client construction, so
+        # latency_ms is comparable with the HTTP providers' request window.
+        start = perf_counter()
+        try:
             response = await self.hass.async_add_executor_job(
                 partial(client.converse, **converse_kwargs)
             )
             _LOGGER.debug(f"AWS Bedrock call Response: {response}")
-
+        except ClientError as e:
+            # boto3 raises ClientError for EVERY non-2xx converse outcome
+            # (AccessDenied 403, Throttling 429, Validation 400, 5xx...) —
+            # it never returns an error-status response dict. Classify from
+            # the exception's ResponseMetadata so Bedrock failures get the
+            # same auth/rate_limit/... visibility as HTTP providers.
+            err_response = getattr(e, "response", None)
+            status = None
+            if isinstance(err_response, dict):
+                status = err_response.get("ResponseMetadata", {}).get(
+                    "HTTPStatusCode"
+                )
+            self._fire_error_event(
+                status_code=status if isinstance(status, int) else None,
+                error_type=(
+                    _classify_http_error(status)
+                    if isinstance(status, int)
+                    else "other"
+                ),
+                latency_ms=int((perf_counter() - start) * 1000),
+            )
+            raise ServiceValidationError(f"Request failed: {e}")
         except Exception as e:
             self._fire_error_event(
                 status_code=None,
