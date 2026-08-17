@@ -117,6 +117,9 @@ class CounterSensorBase(LLMVisionUsageSensor):
     """A monotonically increasing counter; long-term statistics from install."""
 
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    # Counters read 0 from install (not "unknown") so long-term statistics
+    # start immediately — the restore path overwrites this per instance.
+    _attr_native_value = 0
 
     def _restore_value(self, value: Any) -> None:
         # Stored native values round-trip as Decimal/float; counters are ints.

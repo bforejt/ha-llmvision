@@ -135,17 +135,20 @@ class TestTokenCounter:
         s._handle_signal(usage_payload())
         assert s.native_value == 80
 
+    def test_starts_at_zero_not_unknown(self):
+        assert self._sensor().native_value == 0
+
     def test_zero_delta_writes_no_state(self):
         s = self._sensor(key="cache_read_tokens")
         s._handle_signal(usage_payload(cache_read_tokens=0))
-        assert s.native_value is None
+        assert s.native_value == 0
         s.async_write_ha_state.assert_not_called()
 
     def test_missing_and_garbage_values_ignored(self):
         s = self._sensor()
         s._handle_signal({})  # missing key
         s._handle_signal(usage_payload(input_tokens="not-a-number"))
-        assert s.native_value is None
+        assert s.native_value == 0
         s.async_write_ha_state.assert_not_called()
 
     def test_state_class_is_total_increasing(self):
@@ -229,16 +232,16 @@ class TestRestore:
         assert s.native_value == 12350
 
     @pytest.mark.asyncio
-    async def test_no_stored_data_leaves_value_unset(self, mock_hass):
+    async def test_no_stored_data_keeps_zero_start(self, mock_hass):
         s = CallCounterSensor(make_entry())
         await self._add(s, _NO_DATA, mock_hass)
-        assert s.native_value is None
+        assert s.native_value == 0
 
     @pytest.mark.asyncio
-    async def test_stored_none_leaves_value_unset(self, mock_hass):
+    async def test_stored_none_keeps_zero_start(self, mock_hass):
         s = CallCounterSensor(make_entry())
         await self._add(s, None, mock_hass)
-        assert s.native_value is None
+        assert s.native_value == 0
 
     @pytest.mark.asyncio
     async def test_garbage_stored_value_resets_to_zero(self, mock_hass):
