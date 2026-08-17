@@ -107,7 +107,27 @@ Note that events also fire when you save a provider in the setup flow (`service:
 
 ### Native sensors
 
-Since fork build 1.7.1.3, every provider config entry also creates a device with native sensors — no YAML required: **Input tokens**, **Output tokens**, **Cached tokens** (`total_increasing` counters with long-term statistics), **API calls** (billed successes only), **API errors** (transport failures), and **Last latency**. Counts are per provider entry by construction and survive restarts. Validation calls made from the setup flow before the entry exists are not counted. Cost is deliberately not computed here: providers don't report pricing, so cost tracking stays in user configuration built on the events below.
+Since fork build 1.7.1.3, every provider config entry creates a **device** with six sensors — zero configuration, visible under *Settings → Devices & Services → LLM Vision* from the moment the integration loads:
+
+| Sensor | State class | What it tracks |
+|---|---|---|
+| **Input tokens** | `total_increasing` | All billed input tokens, cached included |
+| **Output tokens** | `total_increasing` | All billed output tokens, reasoning included |
+| **Cached tokens** | `total_increasing` | Cache-read subset of input tokens — informational, never added on top |
+| **API calls** | `total_increasing` | Billed successful calls only |
+| **API errors** | `total_increasing` | Transport failures (non-200, network, failed body read) |
+| **Last latency** | `measurement` | Round-trip ms of the most recent successful call |
+
+Entity ids derive from the entry title: an entry named *Anthropic Claude* produces `sensor.anthropic_claude_input_tokens`, and so on.
+
+Design notes:
+
+- **Per-provider by construction.** Each entry's sensors are updated only by that entry's own API calls — the transport layer addresses them per config entry, it doesn't filter after the fact. Two accounts of the same provider stay separate.
+- **Counters start at `0` and survive restarts.** `total_increasing` with restore means long-term statistics accrue from install, with no template tricks and no reset on reboot.
+- **Same contract as the events.** API calls counts billed successes only; failures land in API errors. A validation call made from the setup flow before the entry exists is counted nowhere.
+- **Cost is deliberately not a sensor.** Providers do not report pricing in their API responses, and rates change too often to maintain in integration code — a stale hardcoded rate table would silently corrupt everyone's cost history. The events below carry everything needed (normalized token counts, model, provider), so pricing stays in user configuration where rates can be kept current.
+
+The sensors and the events are two layers over the same data, and they are complementary: sensors are the zero-config surface for dashboards and long-term statistics; the events are the full-fidelity hook — per-call payloads with request identity, latency, and context chaining — for automations, cost ledgers, and external databases like InfluxDB.
 
 A trigger-based template sensor is the simplest way to accumulate totals across all providers (or to enrich events with pricing):
 
@@ -130,6 +150,9 @@ template:
 ```
 
 Point a [Utility Meter helper](https://www.home-assistant.io/integrations/utility_meter/) at these sensors for daily or monthly cycles. Each event also carries the context of the automation or script that triggered the call, so usage can be traced back to its caller.
+
+>[!TIP]
+>If you build a per-model rate table on top of these events, match the `model` field by **prefix**, not equality: providers frequently report dated variants (`claude-haiku-4-5-20251001`, `gpt-4o-2024-08-06`) that bill at the base model's rate but won't hit an exact-match table entry.
 
 ## Resources
 Check the docs for detailed instructions on how to set up LLM Vision and each of the supported providers, get inspiration from examples or join the discussion on the Home Assistant Community and Discord.
