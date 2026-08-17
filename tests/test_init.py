@@ -282,19 +282,26 @@ class TestEntryLifecycle:
         assert ok is True
 
     @pytest.mark.anyio
-    async def test_async_unload_entry_with_and_without_calendar(self):
+    async def test_async_unload_entry_per_entry_kind(self):
         hass = _make_hass()
 
         with_calendar = Mock(title="settings")
         with_calendar.data = {"retention_time": 7}
-        without_calendar = Mock(title="provider")
-        without_calendar.data = {"provider": "OpenAI"}
+        provider_entry = Mock(title="provider")
+        provider_entry.data = {"provider": "OpenAI"}
+        bare_entry = Mock(title="bare")
+        bare_entry.data = {}
 
         assert await async_unload_entry(hass, with_calendar) is True
-        assert await async_unload_entry(hass, without_calendar) is True
-        hass.config_entries.async_unload_platforms.assert_awaited_once_with(
-            with_calendar, ["calendar"]
-        )
+        assert await async_unload_entry(hass, provider_entry) is True
+        assert await async_unload_entry(hass, bare_entry) is True
+        # Settings/calendar entries unload the calendar platform; provider
+        # entries unload the native usage sensor platform (>= 1.7.1.3);
+        # entries with neither unload nothing.
+        assert hass.config_entries.async_unload_platforms.await_args_list == [
+            ((with_calendar, ["calendar"]),),
+            ((provider_entry, ["sensor"]),),
+        ]
 
 
 class TestMigration:
